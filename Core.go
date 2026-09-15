@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -25,17 +24,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
-
-	"golang.org/x/crypto/pbkdf2"
-	"golang.org/x/crypto/hkdf"
 )
 
 // --- CONFIGURATION (ROTATE PER DEPLOYMENT) ---
