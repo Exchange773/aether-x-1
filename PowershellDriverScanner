@@ -1,0 +1,8 @@
+# Minimal version — no objects, no CSV
+dir C:\Windows\System32\drivers\*.sys | % {
+    $p = $_.FullName
+    $s = "NO"; if ((gi $p -ea 0 | % { (Get-AuthenticodeSignature $_).Status }) -eq "Valid") { $s = "YES" }
+    $v = gi $p -ea 0 | % { $_.VersionInfo.ProductVersion }
+    $c = gi $p -ea 0 | % { $_.VersionInfo.CompanyName }
+    "$($_.Name) | Ver: $v | Comp: $c | Signed: $s"
+} | Tee-Object -FilePath "$env:USERPROFILE\Desktop\drivers_simple.txt"
